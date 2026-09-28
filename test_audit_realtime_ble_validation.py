@@ -1,0 +1,1096 @@
+#!/usr/bin/env python3
+import json
+import plistlib
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from tools import audit_realtime_ble_validation as audit
+
+STATE_PULL_SUMMARY_FILE = Path(__file__).resolve()
+
+
+def write_summary(root: Path, label: str, payload: dict) -> Path:
+    path = root / label / "summary.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"label": label, **payload}
+    state_pull = payload.get("state_pull")
+    if isinstance(state_pull, dict) and state_pull.get("summary_file") == str(STATE_PULL_SUMMARY_FILE):
+        state_file = path.parent / "state" / "pull-summary.txt"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text("file_durability_status=saved_sessions_present\n", encoding="utf-8")
+        state_pull["summary_file"] = str(state_file)
+    audit_snapshot = payload.get("audit_snapshot")
+    if isinstance(audit_snapshot, dict) and audit_snapshot.get("path") == str(Path(__file__).resolve()):
+        audit_file = path.parent / "audit.md"
+        audit_file.write_text("# Realtime BLE Validation Audit\n", encoding="utf-8")
+        audit_snapshot["path"] = str(audit_file)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def write_state_preferences(summary_path: Path, values: dict) -> None:
+    state_file = summary_path.parent / "state" / "pull-summary.txt"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    if not state_file.exists():
+        state_file.write_text("file_durability_status=saved_sessions_present\n", encoding="utf-8")
+    with (state_file.parent / "preferences.plist").open("wb") as handle:
+        plistlib.dump(values, handle)
+
+
+def write_final_coexistence_pull(root: Path, label: str = "whoop-uninstalled-final-test") -> Path:
+    path = root / label / "pull-summary.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join([
+            "process_status=running",
+            "process_name_status=atria",
+            "official_whoop_process_status=not_listed",
+            "official_whoop_process_count=0",
+            "official_whoop_main_process=0",
+            "official_whoop_widget_process=0",
+            "official_whoop_coexistence_risk=0",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    return path
+
+
+def passing_stream(**extra):
+    data = {
+        "status": "pass",
+        "samples": 91,
+        "started_at": "2026-06-23T00:00:00Z",
+        "finished_at": "2026-06-23T03:00:00Z",
+        "min_raw_notification_delta": 60,
+        "min_accepted_sample_delta": 60,
+        "max_disconnect_delta": 0,
+        "max_hr_continuity_delta": 0,
+        "flags": [],
+        "audit_snapshot": {
+            "status": "incomplete",
+            "path": str(Path(__file__).resolve()),
+            "summary_count": 4,
+        },
+    }
+    data.update(extra)
+    return data
+
+
+def passing_state():
+    return {
+        "status": "ok",
+        "summary_file": str(STATE_PULL_SUMMARY_FILE),
+        "fields": {
+            "active_journal_freshness": "fresh",
+            "active_journal_continuity_status": "active",
+            "active_journal_duration_s": "10800",
+            "active_journal_samples": "10000",
+            "file_durability_status": "saved_sessions_present",
+        },
+    }
+
+
+def passing_state_with_range_loss_backfill():
+    state = passing_state()
+    state["fields"] = {
+        **state["fields"],
+        "offline_sync_last_status": "armed",
+        "offline_sync_last_reason": "long_wear_range_loss",
+        "offline_range_loss_backfill_pending": "1",
+        "offline_range_loss_backfill_reason": "long_wear_range_loss",
+        "offline_range_loss_backfill_requested_age_s": "12.0",
+        "offline_range_loss_backfill_started_age_s": "-1.0",
+    }
+    return state
+
+
+def passing_state_with_completed_range_loss_backfill():
+    state = passing_state_with_range_loss_backfill()
+    state["fields"] = {
+        **state["fields"],
+        "offline_sync_last_status": "archived",
+        "offline_range_loss_backfill_pending": "0",
+        "offline_range_loss_backfill_started_age_s": "4.0",
+    }
+    return state
+
+
+def passing_app_switch(**extra):
+    data = passing_stream(
+        samples=4,
+        started_at="2026-06-23T00:00:00Z",
+        finished_at="2026-06-23T00:06:00Z",
+        planned_interval_s=120,
+        git_commit=audit.MIN_APP_SWITCH_LIFECYCLE_COMMIT,
+        state_pull=passing_state(),
+        events={"1": ["app_switch_background"], "2": ["app_switch_return"]},
+        operator_actions=[
+            {
+                "sample": 1,
+                "events": ["app_switch_background"],
+                "actions": ["Switch away from Atria now and keep another app foregrounded."],
+            },
+            {
+                "sample": 2,
+                "events": ["app_switch_return"],
+                "actions": ["Return to Atria now."],
+            },
+        ],
+    )
+    data.update(extra)
+    return data
+
+
+def passing_brief_contact_loss(**extra):
+    data = passing_stream(
+        samples=5,
+        planned_interval_s=120,
+        state_pull=passing_state(),
+        events={"1": ["brief_contact_loss_start"], "2": ["brief_contact_loss_reseat"]},
+        operator_actions=[
+            {
+                "sample": 1,
+                "events": ["brief_contact_loss_start"],
+                "actions": ["Loosen or lift the strap for about 30 seconds."],
+            },
+            {
+                "sample": 2,
+                "events": ["brief_contact_loss_reseat"],
+                "actions": ["Reseat the strap firmly now."],
+            },
+        ],
+        event_outcomes=[{
+            "events": ["brief_contact_loss_reseat"],
+            "status": "recovered",
+            "next_raw_notification_delta": 70,
+            "next_disconnect_delta": 0,
+            "next_hr_continuity_delta": 0,
+        }],
+    )
+    data.update(extra)
+    return data
+
+
+def passing_sustained_silence(**extra):
+    data = {
+        "status": "fail",
+        "samples": 7,
+        "planned_interval_s": 120,
+        "state_pull": passing_state(),
+        "min_raw_notification_delta": 0,
+        "max_disconnect_delta": 1,
+        "max_hr_continuity_delta": 1,
+        "flags": ["NO_NEW_DATA", "ZERO_CONTACT"],
+        "audit_snapshot": {
+            "status": "incomplete",
+            "path": str(Path(__file__).resolve()),
+            "summary_count": 4,
+        },
+        "events": {"1": ["sustained_silence_start"], "3": ["sustained_silence_reseat"]},
+        "operator_actions": [
+            {
+                "sample": 1,
+                "events": ["sustained_silence_start"],
+                "actions": ["Take the strap off and set it down until the reseat marker."],
+            },
+            {
+                "sample": 3,
+                "events": ["sustained_silence_reseat"],
+                "actions": ["Reseat the strap firmly now."],
+            },
+        ],
+        "event_outcomes": [{
+            "events": ["sustained_silence_reseat"],
+            "status": "recovered",
+            "next_raw_notification_delta": 42,
+            "next_disconnect_delta": 1,
+            "next_hr_continuity_delta": 1,
+        }],
+    }
+    data.update(extra)
+    return data
+
+
+class AuditRealtimeBLEValidationTests(unittest.TestCase):
+    def setUp(self):
+        global STATE_PULL_SUMMARY_FILE
+        self._state_pull_tmp = tempfile.TemporaryDirectory()
+        STATE_PULL_SUMMARY_FILE = Path(self._state_pull_tmp.name) / "pull-summary.txt"
+        STATE_PULL_SUMMARY_FILE.write_text("file_durability_status=saved_sessions_present\n", encoding="utf-8")
+
+    def tearDown(self):
+        self._state_pull_tmp.cleanup()
+
+    def test_next_actions_use_public_safe_device_placeholders(self):
+        for action in audit.NEXT_ACTIONS.values():
+            self.assertNotRegex(action["command"], r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}")
+            self.assertNotIn("known iPhone", action["command"])
+            self.assertIn("<physical-device-id>", action["command"])
+
+    def test_incomplete_when_required_physical_evidence_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-ok", passing_app_switch())
+
+            report = audit.evaluate(root)
+
+            self.assertEqual(report["status"], "incomplete")
+            self.assertIn("daytime_worn_monitor:missing_evidence", report["blockers"])
+            self.assertIn("brief_contact_loss:missing_evidence", report["blockers"])
+            self.assertIn("sustained_silence_reseat:missing_evidence", report["blockers"])
+            self.assertEqual(report["requirements"]["app_switch"]["status"], "pass")
+            self.assertIn("T", report["generated_at"])
+            self.assertEqual(report["summary_count"], 1)
+            self.assertEqual(report["valid_summary_count"], 1)
+            self.assertEqual(report["requirements"]["daytime_worn_monitor"]["candidate_count"], 0)
+            self.assertEqual(report["requirements"]["app_switch"]["candidate_count"], 1)
+            self.assertIn("rt-daytime-", report["requirements"]["daytime_worn_monitor"]["next_command"])
+            self.assertIn("loosen/lift", report["requirements"]["brief_contact_loss"]["operator_action"])
+            self.assertIn("take the strap off", report["requirements"]["sustained_silence_reseat"]["operator_action"])
+
+    def test_full_report_passes_with_all_required_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-pass", passing_stream(state_pull=passing_state()))
+            write_summary(root, "rt-brief-contact-loss-pass", passing_brief_contact_loss())
+            write_summary(root, "rt-sustained-silence-pass", passing_sustained_silence())
+            write_summary(root, "rt-clock-switch-pass", passing_app_switch())
+
+            report = audit.evaluate(root)
+
+            self.assertEqual(report["status"], "pass")
+            self.assertEqual(report["blockers"], [])
+
+    def test_markdown_prints_next_actions_only_for_incomplete_requirements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-ok", passing_app_switch())
+
+            report = audit.evaluate(root)
+            markdown = audit.markdown_summary(report)
+
+            self.assertIn("Next command: `ATRIA_DEVICE_ID=", markdown)
+            self.assertIn("Operator action: Wear the strap continuously", markdown)
+            self.assertIn("Generated at:", markdown)
+            self.assertIn("Summaries inspected:", markdown)
+            self.assertIn("Valid summaries:", markdown)
+            self.assertIn("Invalid summaries:", markdown)
+            self.assertIn("Candidates: `0`", markdown)
+            self.assertIn("Candidates: `1`", markdown)
+            self.assertIn("Evidence: samples=`4`, duration_s=`360`, min_raw_delta=`60`", markdown)
+            self.assertIn("min_accepted_delta=`60`", markdown)
+            self.assertIn("Continuity: state_pull=`ok`, file_durability=`saved_sessions_present`", markdown)
+            self.assertIn("audit_snapshot=`incomplete`, audit_summaries=`4`", markdown)
+            app_switch_section = markdown.split("- `app_switch`: `pass`", 1)[1]
+            self.assertNotIn("Next command:", app_switch_section)
+
+    def test_invalid_summary_is_reported_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-ok", passing_app_switch())
+            bad = root / "rt-daytime-partial" / "summary.json"
+            bad.parent.mkdir()
+            bad.write_text("{", encoding="utf-8")
+
+            report = audit.evaluate(root)
+            markdown = audit.markdown_summary(report)
+
+            self.assertEqual(report["summary_count"], 2)
+            self.assertEqual(report["valid_summary_count"], 1)
+            self.assertEqual(len(report["invalid_summaries"]), 1)
+            self.assertIn("rt-daytime-partial/summary.json", report["invalid_summaries"][0]["summary"])
+            self.assertIn("invalid_summary:", " ".join(report["blockers"]))
+            self.assertIn("## Invalid Summaries", markdown)
+            self.assertIn("JSONDecodeError", markdown)
+
+    def test_invalid_summary_blocks_otherwise_passing_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-pass", passing_stream(state_pull=passing_state()))
+            write_summary(root, "rt-brief-contact-loss-pass", passing_brief_contact_loss())
+            write_summary(root, "rt-sustained-silence-pass", passing_sustained_silence())
+            write_summary(root, "rt-clock-switch-pass", passing_app_switch())
+            bad = root / "rt-daytime-corrupt" / "summary.json"
+            bad.parent.mkdir()
+            bad.write_text("{", encoding="utf-8")
+
+            report = audit.evaluate(root)
+
+            self.assertEqual(report["status"], "incomplete")
+            self.assertEqual(report["valid_summary_count"], 4)
+            self.assertTrue(any(blocker.startswith("invalid_summary:") for blocker in report["blockers"]))
+            self.assertIn("## Invalid Summaries", audit.markdown_summary(report))
+
+    def test_markdown_prints_missing_for_absent_optional_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-legacy", {
+                "status": "pass",
+                "samples": 4,
+                "started_at": "2026-06-23T00:00:00Z",
+                "finished_at": "2026-06-23T00:01:00Z",
+                "min_raw_notification_delta": 18,
+                "max_disconnect_delta": 0,
+                "max_hr_continuity_delta": 0,
+                "flags": [],
+            })
+
+            markdown = audit.markdown_summary(audit.evaluate(root))
+
+            self.assertIn("min_accepted_delta=`missing`", markdown)
+            self.assertNotIn("min_accepted_delta=`None`", markdown)
+
+    def test_cli_writes_markdown_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "logs"
+            out = Path(tmp) / "audit" / "report.md"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "tools/audit_realtime_ble_validation.py",
+                    "--root",
+                    str(root),
+                    "--markdown",
+                    "--out",
+                    str(out),
+                ],
+                cwd=Path(__file__).resolve().parent,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            text = out.read_text(encoding="utf-8")
+            self.assertIn("# Realtime BLE Validation Audit", text)
+            self.assertIn("Next command:", text)
+
+    def test_cli_allows_incomplete_when_archiving_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "logs"
+            out = Path(tmp) / "audit" / "report.md"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "tools/audit_realtime_ble_validation.py",
+                    "--root",
+                    str(root),
+                    "--markdown",
+                    "--out",
+                    str(out),
+                    "--allow-incomplete",
+                ],
+                cwd=Path(__file__).resolve().parent,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Status: `incomplete`", out.read_text(encoding="utf-8"))
+
+    def test_cli_writes_json_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "logs"
+            out = Path(tmp) / "audit" / "report.json"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "tools/audit_realtime_ble_validation.py",
+                    "--root",
+                    str(root),
+                    "--out",
+                    str(out),
+                ],
+                cwd=Path(__file__).resolve().parent,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "incomplete")
+            self.assertIn("daytime_worn_monitor", report["requirements"])
+
+    def test_daytime_requires_state_pull_continuity_not_just_green_ticks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-weak", passing_stream(
+                state_pull={
+                    "status": "ok",
+                    "summary_file": str(STATE_PULL_SUMMARY_FILE),
+                    "fields": {
+                        "active_journal_freshness": "stale",
+                        "active_journal_continuity_status": "stalled",
+                        "active_journal_duration_s": "150",
+                        "active_journal_samples": "158",
+                        "file_durability_status": "saved_sessions_present",
+                    },
+                },
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertIn("active_journal_not_fresh", blockers)
+            self.assertIn("active_journal_not_active", blockers)
+            self.assertIn("active_journal_duration_under_2h", blockers)
+
+    def test_daytime_blocks_when_official_whoop_process_coexists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = passing_state()
+            state["fields"] = {
+                **state["fields"],
+                "official_whoop_process_status": "running",
+                "official_whoop_process_count": "1",
+                "official_whoop_widget_process": "1",
+                "official_whoop_coexistence_risk": "1",
+            }
+            write_summary(root, "rt-daytime-whoop-widget", passing_stream(state_pull=state))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertIn("official_whoop_coexistence_risk_present", blockers)
+
+    def test_daytime_coexistence_blocker_reports_coexistence_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = passing_state()
+            state["fields"] = {
+                **state["fields"],
+                "official_whoop_process_status": "running",
+                "official_whoop_coexistence_risk": "1",
+            }
+            write_summary(root, "rt-daytime-whoop-coexistence", passing_stream(state_pull=state))
+
+            report = audit.evaluate(root)
+            section = report["requirements"]["daytime_worn_monitor"]
+
+            self.assertIn("official_whoop_coexistence_risk=0", section["operator_action"])
+            self.assertIn("pull_atria_state.sh", section["next_command"])
+            self.assertNotIn("--samples 91", section["next_command"])
+
+    def test_daytime_final_coexistence_pull_clears_coexistence_blocker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = passing_state()
+            state["fields"] = {
+                **state["fields"],
+                "official_whoop_process_status": "running",
+                "official_whoop_process_count": "2",
+                "official_whoop_main_process": "1",
+                "official_whoop_widget_process": "1",
+                "official_whoop_coexistence_risk": "1",
+            }
+            write_summary(root, "rt-daytime-whoop-coexistence", passing_stream(state_pull=state))
+            write_final_coexistence_pull(root)
+
+            report = audit.evaluate(root)
+            section = report["requirements"]["daytime_worn_monitor"]
+
+            self.assertEqual(section["status"], "pass")
+            self.assertEqual(section["blockers"], [])
+            self.assertEqual(section["coexistence_resolution"]["status"], "cleared")
+            self.assertIn("whoop-uninstalled-final-test", section["coexistence_resolution"]["summary_file"])
+
+    def test_daytime_accepts_disconnect_continuity_checkpoint_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = passing_state_with_range_loss_backfill()
+            state["fields"] = {
+                **state["fields"],
+                "active_journal_duration_s": "488",
+                "active_journal_samples": "510",
+                "link_last_auto_save_status": "checkpointed_continuity",
+                "link_last_auto_save_samples": "8160",
+                "link_last_auto_save_duration_s": "7857",
+            }
+            write_summary(root, "rt-daytime-continuity-checkpoint", passing_stream(
+                max_disconnect_delta=1,
+                state_pull=state,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertNotIn("active_journal_duration_under_2h", blockers)
+            self.assertNotIn("active_journal_too_few_samples", blockers)
+
+    def test_daytime_enriches_disconnect_continuity_checkpoint_from_preferences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = passing_state_with_range_loss_backfill()
+            state["fields"] = {
+                **state["fields"],
+                "active_journal_duration_s": "488",
+                "active_journal_samples": "510",
+            }
+            summary_path = write_summary(root, "rt-daytime-continuity-preferences", passing_stream(
+                max_disconnect_delta=1,
+                state_pull=state,
+            ))
+            write_state_preferences(summary_path, {
+                "atria.link.lastAutoSaveStatus": "checkpointed_continuity",
+                "atria.link.lastAutoSaveSamples": 8160,
+                "atria.link.lastAutoSaveDuration": 7857,
+            })
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertNotIn("active_journal_duration_under_2h", blockers)
+            self.assertNotIn("active_journal_too_few_samples", blockers)
+
+    def test_daytime_requires_embedded_audit_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-no-audit-snapshot", passing_stream(
+                audit_snapshot=None,
+                state_pull=passing_state(),
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertIn("missing_audit_snapshot", blockers)
+
+    def test_daytime_requires_audit_snapshot_file_to_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-missing-audit-file", passing_stream(
+                audit_snapshot={
+                    "status": "incomplete",
+                    "path": str(Path(tmp) / "missing-audit.md"),
+                    "summary_count": 4,
+                },
+                state_pull=passing_state(),
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertIn("audit_snapshot_file_missing", blockers)
+
+    def test_daytime_accepts_artifact_paths_relative_to_run_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "rt-daytime-relative-artifacts"
+            (run / "state").mkdir(parents=True)
+            (run / "state" / "pull-summary.txt").write_text(
+                "file_durability_status=saved_sessions_present\n",
+                encoding="utf-8",
+            )
+            (run / "audit.md").write_text("# Realtime BLE Validation Audit\n", encoding="utf-8")
+            write_summary(root, "rt-daytime-relative-artifacts", passing_stream(
+                audit_snapshot={
+                    "status": "incomplete",
+                    "path": "audit.md",
+                    "summary_count": 4,
+                },
+                state_pull={
+                    "status": "ok",
+                    "summary_file": "state/pull-summary.txt",
+                    "fields": {
+                        "active_journal_freshness": "fresh",
+                        "active_journal_continuity_status": "active",
+                        "active_journal_duration_s": "10800",
+                        "active_journal_samples": "10000",
+                        "file_durability_status": "saved_sessions_present",
+                    },
+                },
+            ))
+
+            report = audit.evaluate(root)
+
+            self.assertEqual(report["requirements"]["daytime_worn_monitor"]["status"], "pass")
+
+    def test_daytime_rejects_audit_snapshot_file_outside_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = Path(tmp) / "other-run" / "audit.md"
+            outside.parent.mkdir()
+            outside.write_text("# copied audit\n", encoding="utf-8")
+            write_summary(root, "rt-daytime-copied-audit", passing_stream(
+                audit_snapshot={
+                    "status": "incomplete",
+                    "path": str(outside),
+                    "summary_count": 4,
+                },
+                state_pull=passing_state(),
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertIn("audit_snapshot_file_outside_run", blockers)
+
+    def test_daytime_rejects_explicit_not_worn_monitor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-not-worn", passing_stream(
+                worn_expected=False,
+                state_pull=passing_state(),
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertIn("monitor_ran_not_worn", blockers)
+
+    def test_daytime_rejects_future_summary_without_accepted_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-no-accepted", passing_stream(
+                min_accepted_sample_delta=0,
+                state_pull=passing_state(),
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertIn("no_positive_accepted_delta_on_every_tick", blockers)
+
+    def test_daytime_allows_range_loss_when_backfill_is_proven(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-range-loss-backfilled", passing_stream(
+                min_raw_notification_delta=0,
+                min_accepted_sample_delta=0,
+                max_disconnect_delta=2,
+                flags=["NO_NEW_DATA"],
+                state_pull=passing_state_with_range_loss_backfill(),
+            ))
+
+            report = audit.evaluate(root)
+
+            self.assertEqual(report["requirements"]["daytime_worn_monitor"]["status"], "pass")
+
+    def test_daytime_allows_range_loss_when_backfill_completed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-range-loss-archived", passing_stream(
+                min_raw_notification_delta=0,
+                min_accepted_sample_delta=0,
+                max_disconnect_delta=2,
+                flags=["NO_NEW_DATA"],
+                state_pull=passing_state_with_completed_range_loss_backfill(),
+            ))
+
+            report = audit.evaluate(root)
+
+            self.assertEqual(report["requirements"]["daytime_worn_monitor"]["status"], "pass")
+
+    def test_daytime_rejects_disconnect_without_range_loss_backfill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-daytime-range-loss-no-backfill", passing_stream(
+                max_disconnect_delta=2,
+                state_pull=passing_state(),
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["daytime_worn_monitor"]["blockers"]
+
+            self.assertIn("disconnect_delta_without_range_loss_backfill", blockers)
+
+    def test_app_switch_rejects_explicit_not_worn_monitor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-not-worn", passing_app_switch(
+                worn_expected=False,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["app_switch"]["blockers"]
+
+            self.assertIn("monitor_ran_not_worn", blockers)
+
+    def test_app_switch_requires_current_disconnect_continuity_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-old-code", passing_stream(
+                samples=4,
+                started_at="2026-06-23T00:00:00Z",
+                finished_at="2026-06-23T00:01:00Z",
+                planned_interval_s=20,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["app_switch"]["blockers"]
+
+            self.assertEqual(report["requirements"]["app_switch"]["status"], "incomplete")
+            self.assertIn("app_switch_evidence_before_disconnect_continuity_fix", blockers)
+
+    def test_app_switch_requires_state_pull_and_audit_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-no-state", passing_app_switch(
+                state_pull=None,
+                audit_snapshot=None,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["app_switch"]["blockers"]
+
+            self.assertIn("missing_ok_state_pull", blockers)
+            self.assertIn("missing_audit_snapshot", blockers)
+
+    def test_app_switch_requires_state_pull_summary_file_to_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = passing_state()
+            state["summary_file"] = str(Path(tmp) / "missing-pull-summary.txt")
+            write_summary(root, "rt-clock-switch-missing-state-file", passing_app_switch(
+                state_pull=state,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["app_switch"]["blockers"]
+
+            self.assertIn("state_pull_summary_file_not_found", blockers)
+
+    def test_app_switch_rejects_state_pull_summary_file_outside_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = Path(tmp) / "other-run" / "pull-summary.txt"
+            outside.parent.mkdir()
+            outside.write_text("file_durability_status=saved_sessions_present\n", encoding="utf-8")
+            state = passing_state()
+            state["summary_file"] = str(outside)
+            write_summary(root, "rt-clock-switch-copied-state", passing_app_switch(
+                state_pull=state,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["app_switch"]["blockers"]
+
+            self.assertIn("state_pull_summary_file_outside_run", blockers)
+
+    def test_app_switch_requires_operator_prompts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-no-prompts", passing_app_switch(
+                operator_actions=[],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["app_switch"]["blockers"]
+
+            self.assertIn("missing_operator_action_app_switch_background", blockers)
+            self.assertIn("missing_operator_action_app_switch_return", blockers)
+
+    def test_app_switch_rejects_unmarked_passive_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-unmarked", passing_app_switch(
+                events={},
+                operator_actions=[],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["app_switch"]["blockers"]
+
+            self.assertIn("missing_event_app_switch_background", blockers)
+            self.assertIn("missing_event_app_switch_return", blockers)
+
+    def test_app_switch_rejects_short_elapsed_marker_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-clock-switch-short", passing_app_switch(
+                planned_interval_s=20,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["app_switch"]["blockers"]
+
+            self.assertIn(
+                "event_elapsed_too_short_app_switch_background_to_app_switch_return",
+                blockers,
+            )
+
+    def test_sustained_silence_allows_expected_off_wrist_no_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-off-wrist", passing_sustained_silence())
+
+            report = audit.evaluate(root)
+
+            self.assertEqual(report["requirements"]["sustained_silence_reseat"]["status"], "pass")
+
+    def test_brief_contact_loss_requires_state_pull(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-brief-contact-loss-no-state", passing_brief_contact_loss(
+                state_pull=None,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["brief_contact_loss"]["blockers"]
+
+            self.assertIn("missing_ok_state_pull", blockers)
+
+    def test_brief_contact_loss_requires_embedded_audit_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-brief-contact-loss-no-audit-snapshot", passing_brief_contact_loss(
+                audit_snapshot=None,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["brief_contact_loss"]["blockers"]
+
+            self.assertIn("missing_audit_snapshot", blockers)
+
+    def test_brief_contact_loss_requires_operator_prompts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-brief-contact-loss-no-prompts", passing_brief_contact_loss(
+                operator_actions=[],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["brief_contact_loss"]["blockers"]
+
+            self.assertIn("missing_operator_action_brief_contact_loss_start", blockers)
+            self.assertIn("missing_operator_action_brief_contact_loss_reseat", blockers)
+
+    def test_brief_contact_loss_requires_operator_prompt_sample_alignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-brief-contact-loss-wrong-prompt-sample", passing_brief_contact_loss(
+                operator_actions=[
+                    {
+                        "sample": 0,
+                        "events": ["brief_contact_loss_start"],
+                        "actions": ["Loosen or lift the strap for about 30 seconds."],
+                    },
+                    {
+                        "sample": 4,
+                        "events": ["brief_contact_loss_reseat"],
+                        "actions": ["Reseat the strap firmly now."],
+                    },
+                ],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["brief_contact_loss"]["blockers"]
+
+            self.assertIn("operator_action_sample_mismatch_brief_contact_loss_start", blockers)
+            self.assertIn("operator_action_sample_mismatch_brief_contact_loss_reseat", blockers)
+
+    def test_brief_contact_loss_requires_expected_operator_prompt_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-brief-contact-loss-wrong-prompt-text", passing_brief_contact_loss(
+                operator_actions=[
+                    {
+                        "sample": 1,
+                        "events": ["brief_contact_loss_start"],
+                        "actions": ["Do something with the strap."],
+                    },
+                    {
+                        "sample": 2,
+                        "events": ["brief_contact_loss_reseat"],
+                        "actions": ["Continue."],
+                    },
+                ],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["brief_contact_loss"]["blockers"]
+
+            self.assertIn("missing_operator_action_brief_contact_loss_start", blockers)
+            self.assertIn("missing_operator_action_brief_contact_loss_reseat", blockers)
+
+    def test_brief_contact_loss_rejects_reversed_event_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-brief-contact-loss-reversed", passing_brief_contact_loss(
+                events={"2": ["brief_contact_loss_start"], "1": ["brief_contact_loss_reseat"]},
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["brief_contact_loss"]["blockers"]
+
+            self.assertIn(
+                "event_order_invalid_brief_contact_loss_start_before_brief_contact_loss_reseat",
+                blockers,
+            )
+
+    def test_brief_contact_loss_rejects_short_elapsed_marker_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-brief-contact-loss-short-elapsed", passing_brief_contact_loss(
+                planned_interval_s=20,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["brief_contact_loss"]["blockers"]
+
+            self.assertIn(
+                "event_elapsed_too_short_brief_contact_loss_start_to_brief_contact_loss_reseat",
+                blockers,
+            )
+
+    def test_sustained_silence_requires_state_pull(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-no-state", passing_sustained_silence(
+                state_pull=None,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn("missing_ok_state_pull", blockers)
+
+    def test_sustained_silence_requires_embedded_audit_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-no-audit-snapshot", passing_sustained_silence(
+                audit_snapshot=None,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn("missing_audit_snapshot", blockers)
+
+    def test_sustained_silence_requires_operator_prompts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-no-prompts", passing_sustained_silence(
+                operator_actions=[],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn("missing_operator_action_sustained_silence_start", blockers)
+            self.assertIn("missing_operator_action_sustained_silence_reseat", blockers)
+
+    def test_sustained_silence_requires_operator_prompt_sample_alignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-wrong-prompt-sample", passing_sustained_silence(
+                operator_actions=[
+                    {
+                        "sample": 0,
+                        "events": ["sustained_silence_start"],
+                        "actions": ["Take the strap off and set it down until the reseat marker."],
+                    },
+                    {
+                        "sample": 4,
+                        "events": ["sustained_silence_reseat"],
+                        "actions": ["Reseat the strap firmly now."],
+                    },
+                ],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn("operator_action_sample_mismatch_sustained_silence_start", blockers)
+            self.assertIn("operator_action_sample_mismatch_sustained_silence_reseat", blockers)
+
+    def test_sustained_silence_requires_expected_operator_prompt_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-wrong-prompt-text", passing_sustained_silence(
+                operator_actions=[
+                    {
+                        "sample": 1,
+                        "events": ["sustained_silence_start"],
+                        "actions": ["Do something with the strap."],
+                    },
+                    {
+                        "sample": 3,
+                        "events": ["sustained_silence_reseat"],
+                        "actions": ["Continue."],
+                    },
+                ],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn("missing_operator_action_sustained_silence_start", blockers)
+            self.assertIn("missing_operator_action_sustained_silence_reseat", blockers)
+
+    def test_sustained_silence_requires_two_sample_marker_spacing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-too-short", passing_sustained_silence(
+                events={"1": ["sustained_silence_start"], "2": ["sustained_silence_reseat"]},
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn(
+                "event_spacing_too_short_sustained_silence_start_to_sustained_silence_reseat",
+                blockers,
+            )
+
+    def test_sustained_silence_rejects_short_elapsed_marker_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-short-elapsed", passing_sustained_silence(
+                planned_interval_s=60,
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn(
+                "event_elapsed_too_short_sustained_silence_start_to_sustained_silence_reseat",
+                blockers,
+            )
+
+    def test_sustained_silence_still_rejects_churn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-churn", passing_sustained_silence(
+                max_disconnect_delta=3,
+                max_hr_continuity_delta=0,
+                flags=["NO_NEW_DATA"],
+                event_outcomes=[{
+                    "events": ["sustained_silence_reseat"],
+                    "status": "recovered",
+                    "next_raw_notification_delta": 42,
+                    "next_disconnect_delta": 3,
+                    "next_hr_continuity_delta": 0,
+                }],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn("disconnect_churn", blockers)
+            self.assertIn("event_disconnect_churn_sustained_silence_reseat", blockers)
+
+    def test_sustained_silence_rejects_unexpected_keepalive_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_summary(root, "rt-sustained-silence-keepalive-flat", passing_sustained_silence(
+                flags=["NO_NEW_DATA", "ZERO_CONTACT", "KEEPALIVE_NOT_ADVANCING"],
+            ))
+
+            report = audit.evaluate(root)
+            blockers = report["requirements"]["sustained_silence_reseat"]["blockers"]
+
+            self.assertIn("unexpected_flags_KEEPALIVE_NOT_ADVANCING", blockers)
+
+
+if __name__ == "__main__":
+    unittest.main()
