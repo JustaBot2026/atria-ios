@@ -34,7 +34,7 @@ jobs:
           rm -rf "$RUNNER_TEMP/atria-derived"
           xcodebuild \
             -project Atria/Atria.xcodeproj \
-            -target Atria \
+            -scheme Atria \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
