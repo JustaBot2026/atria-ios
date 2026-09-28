@@ -1,0 +1,379 @@
+import XCTest
+@testable import Atria
+
+final class AtriaStrapCalibrationArchiveTests: XCTestCase {
+    func testCanonicalFrameRequiresMotionOpcodeAndValidCRC() {
+        let imuFrame = encodeFrame(AtriaIMUDecoder.syntheticRestPayload())
+        XCTAssertEqual(AtriaStrapCalibrationArchive.canonicalValidatedMotionFrame(from: imuFrame), imuFrame)
+
+        var r10Payload = [UInt8](repeating: 0, count: 1_288)
+        r10Payload[0] = 0x2B
+        r10Payload[1] = 0x0A
+        let r10Frame = encodeFrame(r10Payload)
+        XCTAssertEqual(AtriaStrapCalibrationArchive.canonicalValidatedMotionFrame(from: r10Frame), r10Frame)
+
+        let realtimeFrame = encodeFrame([0x28, 0, 0, 0, 0, 0, 0, 0, 60, 0])
+        XCTAssertNil(AtriaStrapCalibrationArchive.canonicalValidatedMotionFrame(from: realtimeFrame))
+
+        let r11Frame = encodeFrame([0x2B, 0x0B] + [UInt8](repeating: 0, count: 1_286))
+        XCTAssertNil(AtriaStrapCalibrationArchive.canonicalValidatedMotionFrame(from: r11Frame))
+
+        var corruptR10 = r10Frame
+        let r10Last = corruptR10.index(before: corruptR10.endIndex)
+        corruptR10[r10Last] ^= 0xff
+        XCTAssertNil(AtriaStrapCalibrationArchive.canonicalValidatedMotionFrame(from: corruptR10))
+
+        var corruptFrame = imuFrame
+        let finalIndex = corruptFrame.index(before: corruptFrame.endIndex)
+        corruptFrame[finalIndex] ^= 0xff
+        let admitted = AtriaStrapCalibrationArchive.nativeCompactIMUDurableFrame(from: corruptFrame)
+        XCTAssertEqual(admitted?.frame, corruptFrame)
+        XCTAssertEqual(admitted?.checksumValid, false)
+        XCTAssertEqual(
+            AtriaStrapCalibrationArchive.canonicalValidatedMotionFrame(from: corruptFrame),
+            corruptFrame,
+            "complete Harvard 0x33 with a checksum exception must still persist"
+        )
+    }
+
+    func testHarvard152ByteCompactIMUPersistsWithoutMatchingCRC32() throws {
+        // Physical 15 Sep stream-5 notify (inrange-38). Decoder accepts it.
+        // Current ISO-HDLC CRC32 matches this trailer; the durable store must
+        // still keep a complete 0x33 when the trailer does not.
+        let liveStationaryFrame = Data(hex:
+            "aa9400b5330100006d8ce1018840580695010100030568000a000a00" +
+            "3dfa23fa30fa3cfa37fa2dfa30fa39fa2ffa25fac0f7c3f7bff7c7f7" +
+            "b5f7b1f7a9f7a8f7bff7bbf785f38ff38bf390f39af392f39af38df3" +
+            "95f395f30a000b000800040002000e000900050004000800fdfffcff" +
+            "fdfff9fff9ff0000fdfffcfffbfffcfffefffefffdfffffffffffeff" +
+            "fffffffffeffffff6b07b094"
+        )
+        XCTAssertEqual(liveStationaryFrame.count, 152)
+        let admittedValid = AtriaStrapCalibrationArchive.nativeCompactIMUDurableFrame(
+            from: liveStationaryFrame
+        )
+        XCTAssertEqual(admittedValid?.frame, liveStationaryFrame)
+        XCTAssertEqual(admittedValid?.checksumValid, true)
+        XCTAssertNotNil(AtriaWhoop4CompactIMUDecoder.decode(frame: liveStationaryFrame))
+
+        var checksumExceptionFrame = liveStationaryFrame
+        let last = checksumExceptionFrame.index(before: checksumExceptionFrame.endIndex)
+        checksumExceptionFrame[last] ^= 0xff
+        let admittedException = AtriaStrapCalibrationArchive.nativeCompactIMUDurableFrame(
+            from: checksumExceptionFrame
+        )
+        XCTAssertEqual(admittedException?.frame, checksumExceptionFrame)
+        XCTAssertEqual(admittedException?.checksumValid, false)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-compact-imu-durable-\(UUID().uuidString)",
+                                    isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = AtriaStrapCalibrationArchive(directoryURL: directory,
+                                                   flushInterval: 60,
+                                                   maximumBufferedBytes: 1_024 * 1_024)
+        archive.recordNativeCompactIMUFrame(
+            checksumExceptionFrame,
+            source: "stream5",
+            receivedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        archive.flushSynchronouslyForTesting()
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let csv = try XCTUnwrap(files.first { $0.pathExtension == "csv" })
+        let text = try String(contentsOf: csv, encoding: .utf8)
+        XCTAssertTrue(text.contains("checksum_exception"), text)
+        XCTAssertTrue(text.contains(",33,"), text)
+        let quality = archive.captureQuality(
+            startMS: 31_558_765_000,
+            endMS: 31_558_766_000
+        )
+        XCTAssertEqual(quality.decodedFrames, 1)
+    }
+
+    func testCalibrationWindowPersistsAcrossLaunchesAndExpires() throws {
+        let suiteName = "AtriaStrapCalibrationArchiveTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+
+        let enabledUntil = try XCTUnwrap(AtriaStrapCalibrationArchive.configuredCaptureUntil(
+            arguments: [AtriaStrapCalibrationArchive.enableArgument],
+            defaults: defaults,
+            now: now,
+            duration: 3_600
+        ))
+        XCTAssertEqual(enabledUntil.timeIntervalSince(now), 3_600, accuracy: 0.001)
+        XCTAssertEqual(AtriaStrapCalibrationArchive.configuredCaptureUntil(
+            arguments: [],
+            defaults: defaults,
+            now: now.addingTimeInterval(60),
+            duration: 3_600
+        ), enabledUntil)
+        XCTAssertNil(AtriaStrapCalibrationArchive.configuredCaptureUntil(
+            arguments: [],
+            defaults: defaults,
+            now: enabledUntil.addingTimeInterval(1)
+        ))
+
+        _ = AtriaStrapCalibrationArchive.configuredCaptureUntil(
+            arguments: [AtriaStrapCalibrationArchive.enableArgument],
+            defaults: defaults,
+            now: now
+        )
+        XCTAssertNil(AtriaStrapCalibrationArchive.configuredCaptureUntil(
+            arguments: [AtriaStrapCalibrationArchive.disableArgument],
+            defaults: defaults,
+            now: now
+        ))
+    }
+
+    func testLegacyOversizedCalibrationWindowIsCleared() throws {
+        let suiteName = "AtriaStrapCalibrationArchiveTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+
+        defaults.set(
+            now.addingTimeInterval(AtriaStrapCalibrationArchive.defaultCaptureDuration)
+                .timeIntervalSince1970,
+            forKey: AtriaStrapCalibrationArchive.captureUntilDefaultsKey
+        )
+
+        XCTAssertNil(AtriaStrapCalibrationArchive.configuredCaptureUntil(
+            arguments: [],
+            defaults: defaults,
+            now: now
+        ))
+        XCTAssertNil(defaults.object(
+            forKey: AtriaStrapCalibrationArchive.captureUntilDefaultsKey
+        ))
+    }
+
+    func testArchiveWritesTruePacketTimestampAndRawStrapFrame() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-step-calibration-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = AtriaStrapCalibrationArchive(directoryURL: directory,
+                                                   flushInterval: 60,
+                                                   maximumBufferedBytes: 1_024 * 1_024)
+        let receivedAt = Date(timeIntervalSince1970: 1_750_000_000.123)
+        let frame = encodeFrame(AtriaIMUDecoder.syntheticShakePayload())
+
+        archive.recordMotionFrame(frame, source: "stream5", receivedAt: receivedAt)
+        archive.flushSynchronouslyForTesting()
+
+        let files = try FileManager.default.contentsOfDirectory(at: directory,
+                                                                includingPropertiesForKeys: nil)
+        XCTAssertEqual(files.count, 1)
+        let contents = try String(contentsOf: XCTUnwrap(files.first), encoding: .utf8)
+        let rows = contents.split(separator: "\n")
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[0], "schema_version,received_at_unix_ms,source,packet_type,record_type,raw_frame_hex")
+        XCTAssertTrue(rows[1].hasPrefix("2,1750000000123,stream5,33,"))
+        XCTAssertTrue(rows[1].hasSuffix(frame.map { String(format: "%02x", $0) }.joined()))
+
+        archive.closeSynchronouslyForTesting()
+    }
+
+    func testArchiveDropsInvalidAndNonMotionStrapFrames() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-step-calibration-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = AtriaStrapCalibrationArchive(directoryURL: directory, flushInterval: 60)
+
+        archive.recordMotionFrame(encodeFrame([0x28, 0, 0, 0, 0, 0, 0, 0, 60, 0]),
+                                  source: "stream5")
+        archive.recordMotionFrame(Data([0x33, 0, 1, 2]), source: "stream5")
+        archive.flushSynchronouslyForTesting()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        archive.closeSynchronouslyForTesting()
+    }
+
+    func testCaptureQualityRequiresContinuousDeviceSecondsAndAlignsManifestBounds() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-step-quality-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = AtriaStrapCalibrationArchive(directoryURL: directory, flushInterval: 60)
+
+        for second in 100..<160 {
+            archive.recordMotionFrame(r10Frame(deviceTimestamp: UInt32(second)),
+                                      source: "stream5",
+                                      receivedAt: Date(timeIntervalSince1970: Double(second) + 0.2))
+        }
+        let quality = archive.captureQuality(startMS: 100_000, endMS: 160_000)
+
+        XCTAssertTrue(quality.isReady)
+        XCTAssertEqual(quality.decodedFrames, 60)
+        XCTAssertEqual(quality.coveragePercent, 100, accuracy: 0.001)
+        XCTAssertEqual(quality.continuityBreaks, 0)
+        XCTAssertEqual(quality.maximumUncoveredGapMS, 0)
+        XCTAssertEqual(quality.alignedStartMS, 100_000)
+        XCTAssertEqual(quality.alignedEndMSExclusive, 160_000)
+    }
+
+    func testCaptureQualityFailsClosedWhenOneDeviceSecondIsMissing() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-step-gap-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = AtriaStrapCalibrationArchive(directoryURL: directory, flushInterval: 60)
+
+        for second in 100..<160 where second != 130 {
+            archive.recordMotionFrame(r10Frame(deviceTimestamp: UInt32(second)), source: "stream5")
+        }
+        let quality = archive.captureQuality(startMS: 100_000, endMS: 160_000)
+
+        XCTAssertFalse(quality.isReady)
+        XCTAssertEqual(quality.decodedFrames, 59)
+        XCTAssertEqual(quality.continuityBreaks, 1)
+        XCTAssertEqual(quality.maximumUncoveredGapMS, 1_000)
+        XCTAssertTrue(quality.failureSummary.contains("gap"))
+    }
+
+    func testCaptureQualityAllowsOnlyPartialSecondBoundaryAlignment() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-step-boundary-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = AtriaStrapCalibrationArchive(directoryURL: directory, flushInterval: 60)
+        for second in 101...160 {
+            archive.recordMotionFrame(r10Frame(deviceTimestamp: UInt32(second)), source: "stream5")
+        }
+
+        let partialSecond = archive.captureQuality(startMS: 100_250, endMS: 160_750)
+        XCTAssertTrue(partialSecond.isReady)
+        XCTAssertEqual(partialSecond.maximumUncoveredGapMS, 750)
+        XCTAssertEqual(partialSecond.alignedStartMS, 101_000)
+        XCTAssertEqual(partialSecond.alignedEndMSExclusive, 161_000)
+
+        let wholeMissingSecond = archive.captureQuality(startMS: 100_000, endMS: 160_750)
+        XCTAssertFalse(wholeMissingSecond.isReady)
+        XCTAssertEqual(wholeMissingSecond.maximumUncoveredGapMS, 1_000)
+    }
+
+    func testArchiveRotatesCurrentFileAndEnforcesTotalByteCap() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-step-cap-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cap: Int64 = 1_024 * 1_024
+        let archive = AtriaStrapCalibrationArchive(directoryURL: directory,
+                                                   flushInterval: 60,
+                                                   maximumBufferedBytes: 16 * 1_024,
+                                                   maximumArchiveBytes: cap)
+
+        for second in 0..<600 {
+            archive.recordMotionFrame(r10Frame(deviceTimestamp: UInt32(second)),
+                                      source: "stream5",
+                                      receivedAt: Date(timeIntervalSince1970: 1_750_000_000 + Double(second)))
+        }
+        archive.closeSynchronouslyForTesting()
+
+        let files = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey]
+        )
+        let sizes = try files.map {
+            Int64(try $0.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+        }
+        XCTAssertFalse(sizes.isEmpty)
+        XCTAssertLessThanOrEqual(sizes.max() ?? 0, cap)
+        XCTAssertLessThanOrEqual(sizes.reduce(0, +), cap)
+    }
+
+    func testMaintenancePrunesExpiredCapturesWithoutAnyNewFrame() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-step-maintenance-tests-\(UUID().uuidString)",
+                                    isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory,
+                                                withIntermediateDirectories: true)
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let expired = directory.appendingPathComponent("strap-imu-20250601-expired.csv")
+        let current = directory.appendingPathComponent("strap-imu-20250608-current.csv")
+        try Data("old\n".utf8).write(to: expired)
+        try Data("new\n".utf8).write(to: current)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-8 * 24 * 60 * 60)],
+            ofItemAtPath: expired.path
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-60)],
+            ofItemAtPath: current.path
+        )
+
+        let archive = AtriaStrapCalibrationArchive(directoryURL: directory,
+                                                   retentionInterval: 7 * 24 * 60 * 60)
+        archive.pruneSynchronouslyForTesting(now: now)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expired.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: current.path))
+    }
+
+    func testNativeR10PersistsWithoutCalibrationWindowUsing241Fixture() throws {
+        var url = URL(fileURLWithPath: #filePath)
+        for _ in 0..<3 {
+            url.deleteLastPathComponent()
+        }
+        url.appendPathComponent(
+            "evidence/2026-09-20-imu-241-lastpacket-1924/lastPacketHex.bin"
+        )
+        let frame = try Data(contentsOf: url)
+        XCTAssertEqual(
+            AtriaStrapCalibrationArchive.crcValidatedNativeR10MotionFrame(from: frame),
+            frame
+        )
+        XCTAssertNil(
+            AtriaStrapCalibrationArchive.nativeCompactIMUDurableFrame(from: frame),
+            "2B/0A must not be labeled Harvard 0x33"
+        )
+        XCTAssertNotNil(AtriaR10MotionDecoder.decode(frame: frame))
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("atria-native-r10-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = AtriaStrapCalibrationArchive(
+            directoryURL: directory,
+            flushInterval: 60,
+            maximumBufferedBytes: 1_024 * 1_024
+        )
+        archive.recordNativeR10MotionFrame(
+            frame,
+            source: "stream5",
+            receivedAt: Date(timeIntervalSince1970: 1_790_000_000)
+        )
+        archive.flushSynchronouslyForTesting()
+        let files = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertEqual(files.count, 1)
+        let contents = try String(contentsOf: XCTUnwrap(files.first), encoding: .utf8)
+        XCTAssertTrue(contents.contains(",2b,0a,"))
+        XCTAssertTrue(contents.contains(frame.map { String(format: "%02x", $0) }.joined()))
+        archive.closeSynchronouslyForTesting()
+    }
+
+    private func r10Frame(deviceTimestamp: UInt32) -> Data {
+        var payload = [UInt8](repeating: 0, count: 1_288)
+        payload[0] = AtriaR10MotionDecoder.packetType
+        payload[1] = AtriaR10MotionDecoder.recordType
+        payload[7] = UInt8(deviceTimestamp & 0xff)
+        payload[8] = UInt8((deviceTimestamp >> 8) & 0xff)
+        payload[9] = UInt8((deviceTimestamp >> 16) & 0xff)
+        payload[10] = UInt8((deviceTimestamp >> 24) & 0xff)
+        return encodeFrame(payload)
+    }
+}
+
+private extension Data {
+    init(hex: String) {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(hex.count / 2)
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            bytes.append(UInt8(hex[index..<next], radix: 16) ?? 0)
+            index = next
+        }
+        self.init(bytes)
+    }
+}

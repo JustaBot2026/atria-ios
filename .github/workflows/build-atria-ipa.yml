@@ -1,0 +1,109 @@
+name: Build Atria iPhone IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - 'Atria/**'
+      - '.github/workflows/build-atria-ipa.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: Build unsigned IPA for SideStore / Sideloadly
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Build Atria for physical iPhone
+        run: |
+          set -o pipefail
+          rm -rf "$RUNNER_TEMP/atria-derived"
+          xcodebuild \
+            -project Atria/Atria.xcodeproj \
+            -target Atria \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/atria-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            build | tee "$RUNNER_TEMP/atria-build.log"
+
+      - name: Locate built app
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH=$(find "$RUNNER_TEMP/atria-derived/Build/Products" -type d -path '*Release-iphoneos/Atria.app' -print -quit)
+          if [ -z "$APP_PATH" ]; then
+            echo 'Atria.app was not found.'
+            find "$RUNNER_TEMP/atria-derived/Build/Products" -maxdepth 4 -print || true
+            exit 1
+          fi
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found: $APP_PATH"
+
+      - name: Prepare sideload-friendly app
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH='${{ steps.locate.outputs.app_path }}'
+
+          # The widget uses an App Group. Removing it from the sideload build
+          # avoids an extra App ID / provisioning capability on free Apple IDs.
+          rm -rf "$APP_PATH/PlugIns"
+
+          # Remove any build-time signature/provision remnants. SideStore or
+          # Sideloadly will create a fresh signature for the user's Apple ID.
+          rm -rf "$APP_PATH/_CodeSignature"
+          rm -f "$APP_PATH/embedded.mobileprovision"
+
+          # Make sure the main app bundle still looks valid.
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist"
+
+      - name: Create IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH='${{ steps.locate.outputs.app_path }}'
+          OUT="$RUNNER_TEMP/atria-ipa"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/Payload"
+          ditto "$APP_PATH" "$OUT/Payload/Atria.app"
+          cd "$OUT"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/Atria-iPhone-unsigned.ipa" Payload
+          ls -lh "$GITHUB_WORKSPACE/Atria-iPhone-unsigned.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Atria-iPhone-unsigned
+          path: Atria-iPhone-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log if the job fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Atria-build-log
+          path: ${{ runner.temp }}/atria-build.log
+          if-no-files-found: ignore
+          retention-days: 7

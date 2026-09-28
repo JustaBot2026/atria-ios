@@ -1,0 +1,167 @@
+import Foundation
+
+/// Pure selection policy for bounded WHOOP historical storage.
+///
+/// Selection never authorizes deletion by itself. A selected sealed chunk must
+/// first pass `AtriaHistoricalRetentionTransaction`; its committed manifest is
+/// the only proof that the raw file may be retired.
+struct AtriaHistoricalRetentionPolicy: Equatable, Sendable {
+    /// 7 days of high-rate raw. Field device 2026-08-19: ~2.99 GB of raw vs
+    /// ~93 MB of aggregates/rollups. A week of IMU-rate frames stays under the
+    /// 512 MB safety cap on typical wear; 30 days of raw does not. Insights
+    /// never ride this horizon: `aggregates-v2`, daily rollups, and the durable
+    /// learned-insight ledger persist independently.
+    static let production = AtriaHistoricalRetentionPolicy(
+        rawHorizon: 7 * 24 * 60 * 60,
+        maximumRawBytes: 512 * 1024 * 1024
+    )
+
+    let rawHorizon: TimeInterval
+    let maximumRawBytes: UInt64
+
+    init(rawHorizon: TimeInterval, maximumRawBytes: UInt64) {
+        precondition(rawHorizon >= 0)
+        precondition(maximumRawBytes > 0)
+        self.rawHorizon = rawHorizon
+        self.maximumRawBytes = maximumRawBytes
+    }
+
+    /// Longest feasible raw window among 90 / 30 / 7 days. IMU-rate archives
+    /// that would overflow the 512 MB cap at 30 or 90 days keep 7 days; a
+    /// small archive can keep a month or a quarter. Insights never use this.
+    static let candidateHorizonDays = [90, 30, 7]
+
+    static func coverageDays(from earliest: Date?, to latest: Date?, now: Date) -> Double {
+        guard let earliest else { return 1 }
+        let end = max(earliest, latest ?? now)
+        return max(1, end.timeIntervalSince(earliest) / 86_400)
+    }
+
+    static func resolvedHorizonDays(
+        storedRawBytes: UInt64,
+        coverageDays: Double,
+        maximumRawBytes: UInt64 = production.maximumRawBytes
+    ) -> Int {
+        let observedDays = max(coverageDays, 1)
+        let bytesPerDay = Double(storedRawBytes) / observedDays
+        for days in candidateHorizonDays {
+            if bytesPerDay * Double(days) <= Double(maximumRawBytes) {
+                return days
+            }
+        }
+        return 7
+    }
+
+    static func policy(
+        storedRawBytes: UInt64,
+        coverageDays: Double
+    ) -> AtriaHistoricalRetentionPolicy {
+        let days = resolvedHorizonDays(
+            storedRawBytes: storedRawBytes,
+            coverageDays: coverageDays
+        )
+        return AtriaHistoricalRetentionPolicy(
+            rawHorizon: TimeInterval(days) * 24 * 60 * 60,
+            maximumRawBytes: production.maximumRawBytes
+        )
+    }
+
+    struct Chunk: Equatable, Sendable {
+        let identifier: String
+        let url: URL
+        let byteCount: UInt64
+        let earliestTimestamp: Date
+        let latestTimestamp: Date
+        /// False for the base append target and today's active daily segment.
+        /// An active file is never selected, even when the cap is exceeded.
+        let isSealed: Bool
+
+        init(identifier: String,
+             url: URL,
+             byteCount: UInt64,
+             earliestTimestamp: Date,
+             latestTimestamp: Date,
+             isSealed: Bool) {
+            precondition(byteCount >= 0)
+            precondition(latestTimestamp >= earliestTimestamp)
+            self.identifier = identifier
+            self.url = url
+            self.byteCount = byteCount
+            self.earliestTimestamp = earliestTimestamp
+            self.latestTimestamp = latestTimestamp
+            self.isSealed = isSealed
+        }
+    }
+
+    enum Reason: String, Codable, Equatable, Sendable {
+        case outsideRawHorizon = "outside_raw_horizon"
+        case hardCapPressure = "hard_cap_pressure"
+    }
+
+    struct Candidate: Equatable, Sendable {
+        let chunk: Chunk
+        let reason: Reason
+    }
+
+    struct Plan: Equatable, Sendable {
+        let candidates: [Candidate]
+        let rawBytesBefore: UInt64
+        /// Expected remaining bytes if every candidate is successfully
+        /// compacted and committed. A failure leaves the corresponding raw
+        /// bytes in place and the real total higher than this estimate.
+        let projectedRawBytes: UInt64
+        let hardCapSatisfied: Bool
+        let blockedActiveBytes: UInt64
+    }
+
+    func plan(chunks: [Chunk], now: Date) -> Plan {
+        let ordered = chunks.sorted {
+            if $0.latestTimestamp != $1.latestTimestamp {
+                return $0.latestTimestamp < $1.latestTimestamp
+            }
+            if $0.earliestTimestamp != $1.earliestTimestamp {
+                return $0.earliestTimestamp < $1.earliestTimestamp
+            }
+            return $0.identifier < $1.identifier
+        }
+        let total = ordered.reduce(UInt64(0)) { partial, chunk in
+            partial.addingReportingOverflow(chunk.byteCount).overflow
+                ? UInt64.max
+                : partial + chunk.byteCount
+        }
+        let cutoff = now.addingTimeInterval(-rawHorizon)
+        var selected = Set<String>()
+        var candidates: [Candidate] = []
+        var projected = total
+
+        // Time retention is the normal path. Boundary-overlapping chunks stay
+        // raw because deleting one would shorten the promised horizon.
+        for chunk in ordered where chunk.isSealed && chunk.latestTimestamp < cutoff {
+            selected.insert(chunk.identifier)
+            candidates.append(Candidate(chunk: chunk, reason: .outsideRawHorizon))
+            projected = projected >= chunk.byteCount ? projected - chunk.byteCount : 0
+        }
+
+        // The byte cap is a safety ceiling, not a second age estimate. If 14
+        // days of high-rate raw data exceed it, retire the oldest remaining
+        // *sealed* chunks only. The active writer can temporarily keep the
+        // process above the ceiling until it is sealed; mutating it would race
+        // ACK-gated appends and risks loss.
+        if projected > maximumRawBytes {
+            for chunk in ordered where chunk.isSealed && !selected.contains(chunk.identifier) {
+                selected.insert(chunk.identifier)
+                candidates.append(Candidate(chunk: chunk, reason: .hardCapPressure))
+                projected = projected >= chunk.byteCount ? projected - chunk.byteCount : 0
+                if projected <= maximumRawBytes { break }
+            }
+        }
+
+        return Plan(
+            candidates: candidates,
+            rawBytesBefore: total,
+            projectedRawBytes: projected,
+            hardCapSatisfied: projected <= maximumRawBytes,
+            blockedActiveBytes: ordered.filter { !$0.isSealed }.reduce(0) { $0 + $1.byteCount }
+        )
+    }
+}

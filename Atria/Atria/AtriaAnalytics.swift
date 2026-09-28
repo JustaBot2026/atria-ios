@@ -1,0 +1,2641 @@
+import Foundation
+
+enum AtriaAnalytics {
+    enum RespRateRsa {
+        static func estimate(samples: [(t: Date, ms: Double)],
+                             now: Date,
+                             lookback: TimeInterval = 90) -> Double? {
+            guard let recentStartIndex = samples.firstIndex(where: { $0.t >= now.addingTimeInterval(-lookback) }) else {
+                return nil
+            }
+            let recent = samples[recentStartIndex...].prefix { $0.t <= now }
+            guard recent.count >= 20,
+                  let first = recent.first?.t,
+                  let last = recent.last?.t else { return nil }
+            let duration = last.timeIntervalSince(first)
+            // Apply the same missing-beat tolerance at the trailing edge as
+            // inside the window; otherwise a disconnected stream can continue
+            // publishing an apparently current breathing rate for ~45 seconds.
+            guard duration.isFinite, duration >= 45,
+                  now.timeIntervalSince(last) <= 5 else { return nil }
+
+            let start = first.timeIntervalSinceReferenceDate
+            let relative = recent.map { ($0.t.timeIntervalSinceReferenceDate - start, $0.ms) }
+            // Fail closed on BLE-drop holes (device logs showed inter-beat gaps
+            // up to ~69s from 118 link disconnects). A large gap means missing
+            // beats; resampling across it manufactures slow low-frequency drift
+            // the periodogram would mislabel as breathing. 2026-07-08.
+            guard recent.allSatisfy({ $0.ms.isFinite && (300...2000).contains($0.ms) }) else { return nil }
+            for index in 1..<relative.count {
+                let gap = relative[index].0 - relative[index - 1].0
+                guard gap.isFinite, gap > 0, gap <= 5 else { return nil }
+            }
+            let sampleRate = 4.0
+            let step = 1.0 / sampleRate
+            let count = Int(duration / step) + 1
+            guard count >= Int(45 * sampleRate) else { return nil }
+
+            var resampled: [Double] = []
+            resampled.reserveCapacity(count)
+            var sourceIndex = 0
+            for index in 0..<count {
+                let t = Double(index) * step
+                while sourceIndex + 1 < relative.count && relative[sourceIndex + 1].0 < t {
+                    sourceIndex += 1
+                }
+                guard sourceIndex + 1 < relative.count else { break }
+                let a = relative[sourceIndex]
+                let b = relative[sourceIndex + 1]
+                let span = b.0 - a.0
+                guard span > 0 else { continue }
+                let fraction = (t - a.0) / span
+                resampled.append(a.1 + (b.1 - a.1) * fraction)
+            }
+            return estimate(resampledRR: resampled, sampleRate: sampleRate)
+        }
+
+        static func estimateCancellable(
+            samples: [(t: Date, ms: Double)],
+            now: Date,
+            lookback: TimeInterval = 90,
+            shouldContinue: () -> Bool
+        ) -> Double? {
+            guard shouldContinue(), !samples.isEmpty else { return nil }
+            let lowerDate = now.addingTimeInterval(-lookback)
+            var lower = 0
+            var upper = samples.count
+            while lower < upper {
+                guard shouldContinue() else { return nil }
+                let middle = (lower + upper) / 2
+                if samples[middle].t < lowerDate {
+                    lower = middle + 1
+                } else {
+                    upper = middle
+                }
+            }
+            guard lower < samples.count else { return nil }
+            var recent: [(t: Date, ms: Double)] = []
+            recent.reserveCapacity(256)
+            var index = lower
+            while index < samples.count, samples[index].t <= now {
+                if index.isMultiple(of: 64), !shouldContinue() { return nil }
+                recent.append(samples[index])
+                index += 1
+            }
+            guard recent.count >= 20,
+                  let first = recent.first?.t,
+                  let last = recent.last?.t else { return nil }
+            let duration = last.timeIntervalSince(first)
+            // Apply the same missing-beat tolerance at the trailing edge as
+            // inside the window; otherwise a disconnected stream can continue
+            // publishing an apparently current breathing rate for ~45 seconds.
+            guard duration.isFinite, duration >= 45,
+                  now.timeIntervalSince(last) <= 5 else { return nil }
+            let origin = first.timeIntervalSinceReferenceDate
+            var relative: [(Double, Double)] = []
+            relative.reserveCapacity(recent.count)
+            for (offset, sample) in recent.enumerated() {
+                if offset.isMultiple(of: 64), !shouldContinue() { return nil }
+                guard sample.ms.isFinite, (300...2000).contains(sample.ms) else { return nil }
+                relative.append((
+                    sample.t.timeIntervalSinceReferenceDate - origin,
+                    sample.ms
+                ))
+            }
+            for index in 1..<relative.count {
+                if index.isMultiple(of: 64), !shouldContinue() { return nil }
+                let gap = relative[index].0 - relative[index - 1].0
+                guard gap.isFinite, gap > 0, gap <= 5 else { return nil }
+            }
+            let sampleRate = 4.0
+            let step = 1.0 / sampleRate
+            let count = Int(duration / step) + 1
+            guard count >= Int(45 * sampleRate) else { return nil }
+            var resampled: [Double] = []
+            resampled.reserveCapacity(count)
+            var sourceIndex = 0
+            for index in 0..<count {
+                if index.isMultiple(of: 64), !shouldContinue() { return nil }
+                let time = Double(index) * step
+                while sourceIndex + 1 < relative.count,
+                      relative[sourceIndex + 1].0 < time {
+                    sourceIndex += 1
+                }
+                guard sourceIndex + 1 < relative.count else { break }
+                let a = relative[sourceIndex]
+                let b = relative[sourceIndex + 1]
+                let span = b.0 - a.0
+                guard span > 0 else { continue }
+                resampled.append(
+                    a.1 + (b.1 - a.1) * ((time - a.0) / span)
+                )
+            }
+            guard shouldContinue() else { return nil }
+            return estimate(resampledRR: resampled, sampleRate: sampleRate)
+        }
+
+        static func estimate(resampledRR: [Double], sampleRate: Double = 4.0) -> Double? {
+            guard resampledRR.count >= Int(45 * sampleRate) else { return nil }
+            let mean = resampledRR.reduce(0, +) / Double(resampledRR.count)
+            let centered = resampledRR.map { $0 - mean }
+            let totalPower = centered.map { $0 * $0 }.reduce(0, +)
+            guard totalPower > 0 else { return nil }
+
+            var bestRate = 0.0
+            var bestPower = 0.0
+            var bandPower = 0.0
+            // Scan the respiratory HF band only (0.15-0.50 Hz = 9-30 bpm).
+            // The old 6 bpm floor (0.10 Hz) sat inside the HRV LF / Mayer-wave
+            // band, so at rest the LF/drift peak routinely won the argmax and
+            // the app reported ~6-8 bpm "breathing" — a fabricated number
+            // below any real resting rate. Raising the floor makes the SNR
+            // gate below evaluate prominence over the true breathing band and
+            // fail closed to "--" when only LF power is present. 2026-07-08.
+            for breathsPerMinute in stride(from: 9.0, through: 30.0, by: 0.5) {
+                let frequency = breathsPerMinute / 60.0
+                var real = 0.0
+                var imaginary = 0.0
+                for (index, value) in centered.enumerated() {
+                    let angle = 2.0 * Double.pi * frequency * Double(index) / sampleRate
+                    real += value * cos(angle)
+                    imaginary -= value * sin(angle)
+                }
+                let power = real * real + imaginary * imaginary
+                bandPower += power
+                if power > bestPower {
+                    bestPower = power
+                    bestRate = breathsPerMinute
+                }
+            }
+            guard bestPower > 0, bestPower / max(bandPower, bestPower) >= 0.18 else { return nil }
+            return bestRate
+        }
+    }
+
+    enum ManualSleep {
+        static func inferredIsNap(start: Date,
+                                  end: Date,
+                                  currentSelection: Bool,
+                                  eventTimeZoneIdentifier: String? = nil,
+                                  calendar: Calendar = .current) -> Bool {
+            guard end > start else { return currentSelection }
+            let duration = end.timeIntervalSince(start)
+            if duration >= AggregateSleepCandidate.strictMinimumDuration {
+                return false
+            }
+            guard duration >= AggregateSleepCandidate.napMinimumDuration,
+                  duration <= AggregateSleepCandidate.napMaximumSpan else {
+                return currentSelection
+            }
+            let startHour = EventCivilTime.localHour(of: start,
+                                                     eventTimeZoneIdentifier: eventTimeZoneIdentifier,
+                                                     fallback: calendar)
+            let endHour = EventCivilTime.localHour(of: end,
+                                                   eventTimeZoneIdentifier: eventTimeZoneIdentifier,
+                                                   fallback: calendar)
+            let daytimeWindow = startHour >= 11 && endHour <= 20
+            return daytimeWindow
+        }
+    }
+
+    enum TargetZones {
+        static func recovery(_ pct: Int?,
+                             target: AtriaMetricTarget = .recoveryRecommended) -> AtriaMetricZone? {
+            guard let pct else { return nil }
+            let level = AtriaMetricZone.zone(for: Double(pct), target: target)
+
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Recovery is inside the range you configured. See Sources for how this derived score is computed."
+            case .yellow:
+                recommendation = "Recovery is below the range you configured. See Sources for how this derived score is computed."
+            case .red:
+                recommendation = "Recovery is well below the range you configured. See Sources for how this derived score is computed."
+            }
+
+            return AtriaMetricZone(level: level,
+                                   title: "Recovery target",
+                                   current: "\(pct)% recovery is \(level.label.lowercased()).",
+                                   targetSummary: target.summaryText,
+                                   recommendation: recommendation,
+                                   disclaimer: AtriaMetricZone.nonMedicalDisclaimer)
+        }
+
+        static func strain(strain: Double,
+                           target: Double?,
+                           greenBand: Double = 1.5,
+                           yellowBand: Double = 3.0) -> AtriaMetricZone? {
+            guard let target else { return nil }
+            let delta = strain - target
+            let absDelta = abs(delta)
+            let safeGreenBand = min(max(greenBand, 0.5), 5.0)
+            let safeYellowBand = min(max(yellowBand, safeGreenBand + 0.5), 8.0)
+            let level: AtriaMetricZoneLevel = absDelta <= safeGreenBand ? .green : (absDelta <= safeYellowBand ? .yellow : .red)
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Strain is inside today's recovery-scaled target band. See Sources for TRIMP."
+            case .yellow where delta > 0:
+                recommendation = "Strain is above today's recovery-scaled target band. See Sources for TRIMP."
+            case .red where delta > 0:
+                recommendation = "Strain is well above today's recovery-scaled target band. See Sources for TRIMP."
+            case .yellow:
+                recommendation = "Strain is below today's recovery-scaled target band. See Sources for TRIMP."
+            case .red:
+                recommendation = "Strain is well below today's recovery-scaled target band. See Sources for TRIMP."
+            }
+            return AtriaMetricZone(level: level,
+                                   title: "Strain target",
+                                   current: String(format: "Strain %.1f vs target %.1f.", strain, target),
+                                   targetSummary: String(format: "Recovery-scaled target · Green within +/-%.1f, yellow within ±%.1f, red farther from %.1f.", safeGreenBand, safeYellowBand, target),
+                                   recommendation: recommendation,
+                                   disclaimer: AtriaMetricZone.nonMedicalDisclaimer)
+        }
+
+        static func hrv(_ rmssd: Int?,
+                        baseline: Int?,
+                        baselineSamples: Int,
+                        baselineTrusted: Bool,
+                        baselineTarget: AtriaBaselineTargetSnapshot? = nil,
+                        greenRatio: Double = 0.95,
+                        yellowRatio: Double = 0.85) -> AtriaMetricZone? {
+            guard baselineTrusted,
+                  baselineSamples >= PersonalBaseline.trustedMinimumSamples,
+                  let rmssd, let baseline, baseline > 0 else { return nil }
+            let ratio = Double(rmssd) / Double(baseline)
+            let safeYellow = min(max(yellowRatio, 0.50), 0.98)
+            let safeGreen = min(max(greenRatio, safeYellow + 0.01), 1.20)
+            let ratioLevel: AtriaMetricZoneLevel = ratio >= safeGreen ? .green : (ratio >= safeYellow ? .yellow : .red)
+            let zScoreText: String
+            let level: AtriaMetricZoneLevel
+            if let baselineTarget,
+               baselineTarget.hrvTrusted,
+               let mean = baselineTarget.hrvLnMean,
+               let sd = baselineTarget.hrvLnSD,
+               sd > 0.1 {
+                let z = zScore(log(Double(rmssd)), mean: mean, sd: sd)
+                let zLevel: AtriaMetricZoneLevel = z >= -1.0 ? .green : (z >= -2.0 ? .yellow : .red)
+                level = worst(ratioLevel, zLevel)
+                zScoreText = String(format: " · z %.1f", z)
+            } else {
+                level = ratioLevel
+                zScoreText = ""
+            }
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "HRV is near your personal baseline. See Sources for the definition."
+            case .yellow:
+                recommendation = "HRV is below your personal baseline. This is a comparison to your own recent nights, not a diagnosis. See Sources."
+            case .red:
+                recommendation = "HRV is well below your personal baseline. This is a comparison to your own recent nights, not a diagnosis. See Sources."
+            }
+            let current = "\(rmssd) ms vs \(baseline) ms baseline."
+            let greenValue = Int((Double(baseline) * safeGreen).rounded())
+            let yellowValue = Int((Double(baseline) * safeYellow).rounded())
+            let target = "Personal baseline · Green \(greenValue)+ ms and within 1 SD\(zScoreText), yellow to 2 SD or \(yellowValue)-\(greenValue - 1) ms, red below."
+            return AtriaMetricZone(level: level,
+                                   title: "HRV target",
+                                   current: current,
+                                   targetSummary: target,
+                                   recommendation: recommendation,
+                                   disclaimer: AtriaMetricZone.nonMedicalDisclaimer)
+        }
+
+        static func restingHeartRate(_ bpm: Int?,
+                                     baseline: Int?,
+                                     baselineSamples: Int,
+                                     baselineTrusted: Bool,
+                                     baselineTarget: AtriaBaselineTargetSnapshot? = nil,
+                                     greenDelta: Int = 3,
+                                     yellowDelta: Int = 7) -> AtriaMetricZone? {
+            guard baselineTrusted,
+                  baselineSamples >= PersonalBaseline.trustedMinimumSamples,
+                  let bpm, let baseline, baseline > 0 else { return nil }
+            let delta = bpm - baseline
+            let safeGreenDelta = min(max(greenDelta, 0), 12)
+            let safeYellowDelta = min(max(yellowDelta, safeGreenDelta + 1), 20)
+            let deltaLevel: AtriaMetricZoneLevel = delta <= safeGreenDelta ? .green : (delta <= safeYellowDelta ? .yellow : .red)
+            let zScoreText: String
+            let level: AtriaMetricZoneLevel
+            if let baselineTarget,
+               baselineTarget.restingTrusted,
+               let mean = baselineTarget.restingMean,
+               let sd = baselineTarget.restingSD,
+               sd > 0.1 {
+                let z = zScore(Double(bpm), mean: mean, sd: sd)
+                let zLevel: AtriaMetricZoneLevel = z <= 1.0 ? .green : (z <= 2.0 ? .yellow : .red)
+                level = worst(deltaLevel, zLevel)
+                zScoreText = String(format: " · z %.1f", z)
+            } else {
+                level = deltaLevel
+                zScoreText = ""
+            }
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Resting heart rate is near your baseline. See Sources."
+            case .yellow:
+                recommendation = "Resting HR is above your baseline. Fatigue, stress, or poor sleep can move this derived overnight value. See Sources."
+            case .red:
+                recommendation = "Resting HR is well above your baseline. This is a comparison to your own recent nights, not a diagnosis. See Sources."
+            }
+            let target = "Personal baseline · Green \(baseline + safeGreenDelta) bpm or lower and within 1 SD\(zScoreText), yellow to 2 SD or \(baseline + safeGreenDelta + 1)-\(baseline + safeYellowDelta) bpm, red above."
+            return AtriaMetricZone(level: level,
+                                   title: "Resting HR target",
+                                   current: "\(bpm) bpm, \(delta >= 0 ? "+" : "")\(delta) vs baseline.",
+                                   targetSummary: target,
+                                   recommendation: recommendation,
+                                   disclaimer: AtriaMetricZone.nonMedicalDisclaimer)
+        }
+
+        private static func zScore(_ value: Double, mean: Double, sd: Double) -> Double {
+            guard sd > 0.1 else { return 0 }
+            return (value - mean) / sd
+        }
+
+        private static func worst(_ lhs: AtriaMetricZoneLevel, _ rhs: AtriaMetricZoneLevel) -> AtriaMetricZoneLevel {
+            let rank: (AtriaMetricZoneLevel) -> Int = { level in
+                switch level {
+                case .green: return 0
+                case .yellow: return 1
+                case .red: return 2
+                }
+            }
+            return rank(lhs) >= rank(rhs) ? lhs : rhs
+        }
+
+        static func sleepEfficiency(_ efficiency: Double?,
+                                    greenLower: Double = 90,
+                                    yellowLower: Double = 80) -> AtriaMetricZone? {
+            guard let efficiency else { return nil }
+            let pct = Int((efficiency * 100).rounded())
+            let safeYellow = min(max(yellowLower, 50), 95)
+            let safeGreen = min(max(greenLower, safeYellow + 1), 99)
+            let level: AtriaMetricZoneLevel = Double(pct) >= safeGreen ? .green : (Double(pct) >= safeYellow ? .yellow : .red)
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Sleep efficiency is in the target zone."
+            case .yellow:
+                recommendation = "Sleep efficiency is below the range you set. This compares classified sleep time with time in bed."
+            case .red:
+                recommendation = "Sleep efficiency is well below the range you set. This compares classified sleep time with time in bed."
+            }
+            return AtriaMetricZone(level: level,
+                                   title: "Sleep efficiency target",
+                                   current: "\(pct)% sleep efficiency.",
+                                   targetSummary: "Editable target · Green \(Int(safeGreen.rounded()))%+, yellow \(Int(safeYellow.rounded()))-\(Int(safeGreen.rounded()) - 1)%, red below \(Int(safeYellow.rounded()))%.",
+                                   recommendation: recommendation,
+                                   disclaimer: AtriaMetricZone.nonMedicalDisclaimer)
+        }
+
+        static func sleepDuration(_ hours: Double?, goalHours: Double = 8.0) -> AtriaMetricZone? {
+            guard let hours, hours > 0 else { return nil }
+            let safeGoal = min(max(goalHours, 4.0), 12.0)
+            let ratio = hours / safeGoal
+            let level: AtriaMetricZoneLevel = ratio >= 1.0 ? .green : (ratio >= 0.85 ? .yellow : .red)
+            let remaining = max(0, safeGoal - hours)
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Sleep duration met the duration you set as a goal."
+            case .yellow:
+                recommendation = "Last night was a little under the sleep duration you set as a goal (\(AtriaMetricFormat.sleepHours(remaining)) remaining versus that goal)."
+            case .red:
+                recommendation = "Last night was under the sleep duration you set as a goal (\(AtriaMetricFormat.sleepHours(remaining)) remaining versus that goal)."
+            }
+            return AtriaMetricZone(level: level,
+                                   title: "Sleep duration target",
+                                   current: "\(AtriaMetricFormat.sleepHours(hours)) sleep vs \(AtriaMetricFormat.sleepHours(safeGoal)) goal.",
+                                   targetSummary: "User goal · Green \(AtriaMetricFormat.sleepHours(safeGoal))+, yellow \(AtriaMetricFormat.sleepHours(safeGoal * 0.85))-\(AtriaMetricFormat.sleepHours(safeGoal - 0.1)), red below \(AtriaMetricFormat.sleepHours(safeGoal * 0.85)).",
+                                   recommendation: recommendation,
+                                   disclaimer: AtriaMetricZone.nonMedicalDisclaimer)
+        }
+
+        /// Sleep Performance is not the same thing as a static duration goal:
+        /// it is effective sleep divided by that night's adaptive Sleep Need.
+        /// WHOOP's planning vocabulary treats 85% as the "perform" threshold,
+        /// while <70% is materially short. Keeping this as a separate target
+        /// prevents an 8h user goal from painting a night green when the same
+        /// screen truthfully says it was only 84% of a 10h adaptive need.
+        static func sleepPerformance(_ percent: Int?,
+                                     neededHours: Double? = nil) -> AtriaMetricZone? {
+            guard let percent else { return nil }
+            let safePercent = min(max(percent, 0), 100)
+            let level: AtriaMetricZoneLevel = safePercent >= 85
+                ? .green
+                : (safePercent >= 70 ? .yellow : .red)
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Sleep duration reached 85% or more of the stored need Atria computed. See Sources."
+            case .yellow:
+                recommendation = "Sleep duration was 70–84% of the stored need Atria computed. See Sources."
+            case .red:
+                recommendation = "Sleep duration was below 70% of the stored need Atria computed. See Sources."
+            }
+            let needText = neededHours.map {
+                " · \(AtriaMetricFormat.sleepHours($0)) adaptive need"
+            } ?? ""
+            return AtriaMetricZone(
+                level: level,
+                title: "Sleep performance",
+                current: "\(safePercent)% of sleep need\(needText).",
+                targetSummary: "Adaptive need · Green 85-100%, yellow 70-84%, red below 70%.",
+                recommendation: recommendation,
+                disclaimer: AtriaMetricZone.nonMedicalDisclaimer
+            )
+        }
+
+        static func steps(_ steps: Int?, goal: Int = 8_000) -> AtriaMetricZone? {
+            guard let steps, steps > 0 else { return nil }
+            let safeGoal = max(goal, 1_000)
+            // A daily step goal is a progress target, not a physiological alarm.
+            // Being below goal partway through the day is normal for everyone, so
+            // we never raise a yellow/red warning triangle here (that read as "something
+            // is wrong" on a calm mid-day card). Only surface a quiet "goal met" state;
+            // the value itself communicates progress, like Apple/WHOOP rings.
+            guard steps >= safeGoal else { return nil }
+            return AtriaMetricZone(level: .green,
+                                   title: "Steps target",
+                                   current: "\(steps) steps vs \(safeGoal) goal.",
+                                   targetSummary: "User goal · Green \(safeGoal)+ steps.",
+                                   recommendation: "Steps are at or above your daily goal.",
+                                   disclaimer: AtriaMetricZone.nonMedicalDisclaimer)
+        }
+
+        static func activeCalories(_ calories: Double?, goal: Int = 500) -> AtriaMetricZone? {
+            guard let calories, calories > 0 else { return nil }
+            let roundedCalories = Int(calories.rounded())
+            let safeGoal = min(max(goal, 100), 3_000)
+            // Same as steps: a daily active-calorie goal is progress, not an alarm.
+            // No yellow/red warning for being mid-day below goal — only a calm "met".
+            guard roundedCalories >= safeGoal else { return nil }
+            return AtriaMetricZone(level: .green,
+                                   title: "Calories target",
+                                   current: "\(roundedCalories) kcal vs \(safeGoal) kcal goal.",
+                                   targetSummary: "User goal · Green \(safeGoal)+ kcal.",
+                                   recommendation: "Estimated active calories are at or above your daily goal.",
+                                   disclaimer: "Estimated from heart rate/profile. \(AtriaMetricZone.nonMedicalDisclaimer)")
+        }
+
+        static func vo2Trend(_ summary: VO2MaxEstimateSummary,
+                             greenDelta: Double = 0.2,
+                             redDelta: Double = -0.2) -> AtriaMetricZone? {
+            guard summary.value != nil,
+                  summary.trendText != "Learning",
+                  let trendDelta = summary.trendDelta else { return nil }
+            let trimmedTrend = summary.trendText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let safeGreenDelta = min(max(greenDelta, 0.0), 2.0)
+            let safeRedDelta = max(min(redDelta, -0.05), -2.0)
+            let level: AtriaMetricZoneLevel
+            if trendDelta >= safeGreenDelta {
+                level = .green
+            } else if trendDelta <= safeRedDelta {
+                level = .red
+            } else {
+                level = .yellow
+            }
+
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "VO2max trend is improving. Cardio minutes and sleep consistency are the inputs this estimate uses. See Sources."
+            case .yellow:
+                recommendation = "VO2max trend is flat. Cardio minutes and sleep consistency are the inputs this estimate uses. See Sources."
+            case .red:
+                recommendation = "VO2max trend is declining. Cardio minutes and sleep consistency are the inputs this estimate uses. See Sources."
+            }
+
+            return AtriaMetricZone(level: level,
+                                   title: "VO2max trend",
+                                   current: "Trend \(trimmedTrend), \(summary.trendDetail)",
+                                   targetSummary: String(format: "Estimate trend · Green +%.1f or more, yellow %.1f to %.1f, red %.1f or lower.", safeGreenDelta, safeRedDelta, safeGreenDelta, safeRedDelta),
+                                   recommendation: recommendation,
+                                   disclaimer: "Estimated fitness trend. \(AtriaMetricZone.nonMedicalDisclaimer)")
+        }
+
+        static func biologicalAge(_ summary: BiologicalAgeSummary,
+                                  greenOlderDelta: Int = 0,
+                                  yellowOlderDelta: Int = 3) -> AtriaMetricZone? {
+            guard summary.isReady, let delta = summary.ageDelta else { return nil }
+            let safeGreenDelta = min(max(greenOlderDelta, -10), 10)
+            let safeYellowDelta = min(max(yellowOlderDelta, safeGreenDelta + 1), 20)
+            let level: AtriaMetricZoneLevel
+            if delta <= safeGreenDelta {
+                level = .green
+            } else if delta <= safeYellowDelta {
+                level = .yellow
+            } else {
+                level = .red
+            }
+
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Fitness age is on the younger side for your profile. Resting HR, HRV, aerobic minutes, and sleep consistency are the inputs this estimate uses. See Sources."
+            case .yellow:
+                recommendation = "Fitness age is slightly older than your profile. Resting HR, HRV, aerobic minutes, and sleep consistency are the inputs this estimate uses. See Sources."
+            case .red:
+                recommendation = "Fitness age is older than your profile. Resting HR, HRV, aerobic minutes, and sleep consistency are the inputs this estimate uses. See Sources."
+            }
+
+            return AtriaMetricZone(level: level,
+                                   title: "Fitness age target",
+                                   current: "\(summary.valueText), \(summary.detailText).",
+                                   targetSummary: "Estimate · Green +\(safeGreenDelta) yr or less vs chronological, yellow +\(safeYellowDelta) yr or less, red above.",
+                                   recommendation: recommendation,
+                                   disclaimer: summary.footnote)
+        }
+
+        static func respiratoryRate(_ breathsPerMinute: Double?,
+                                    baseline: Double?,
+                                    baselineSamples: Int,
+                                    greenDelta: Double = 1.5,
+                                    yellowDelta: Double = 3.0) -> AtriaMetricZone? {
+            guard baselineSamples >= 3,
+                  let breathsPerMinute,
+                  let baseline,
+                  baseline > 0 else { return nil }
+            let delta = breathsPerMinute - baseline
+            let absDelta = abs(delta)
+            let safeGreenDelta = min(max(greenDelta, 0.5), 4.0)
+            let safeYellowDelta = min(max(yellowDelta, safeGreenDelta + 0.5), 8.0)
+            let level: AtriaMetricZoneLevel = absDelta <= safeGreenDelta ? .green : (absDelta <= safeYellowDelta ? .yellow : .red)
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Respiratory rate is close to your local sleep baseline. See Sources."
+            case .yellow:
+                recommendation = "Respiratory rate is slightly off your local sleep baseline. Environment, sleep, or stress can move this derived estimate. See Sources."
+            case .red:
+                recommendation = "Respiratory rate is well off your local sleep baseline. This is a comparison to your own nights, not a diagnosis. See Sources."
+            }
+            return AtriaMetricZone(level: level,
+                                   title: "Respiratory rate baseline",
+                                   current: String(format: "%.1f/min, %+.1f vs %.1f baseline.", breathsPerMinute, delta, baseline),
+                                   targetSummary: String(format: "Early baseline · Green within +/-%.1f/min, yellow within +/-%.1f/min, red farther from %.1f/min.", safeGreenDelta, safeYellowDelta, baseline),
+                                   recommendation: recommendation,
+                                   disclaimer: "Early sleep-only signal. \(AtriaMetricZone.nonMedicalDisclaimer)")
+        }
+
+        static func skinTemperatureDeviation(_ summary: IMUAuditSummary.SkinTemperatureDeviationSummary,
+                                             greenDelta: Double = 0.5,
+                                             yellowDelta: Double = 1.0,
+                                             decoderAvailable: Bool = AtriaResearchProbe.validatedSkinTemperatureDecoderAvailable) -> AtriaMetricZone? {
+            guard decoderAvailable,
+                  summary.isReady,
+                  let delta = summary.latestDeltaCelsius else { return nil }
+            let absDelta = abs(delta)
+            let safeGreenDelta = min(max(greenDelta, 0.2), 2.0)
+            let safeYellowDelta = min(max(yellowDelta, safeGreenDelta + 0.1), 4.0)
+            let level: AtriaMetricZoneLevel = absDelta <= safeGreenDelta ? .green : (absDelta <= safeYellowDelta ? .yellow : .red)
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Skin temperature deviation is close to your local sleep baseline."
+            case .yellow:
+                recommendation = "Skin temperature is slightly off your local sleep baseline. This remains a relative overnight signal, not core temperature."
+            case .red:
+                recommendation = "Skin temperature is well off your local sleep baseline. This remains a relative overnight signal, not core temperature."
+            }
+            return AtriaMetricZone(level: level,
+                                   title: "Skin temperature baseline",
+                                   current: String(format: "%+.1f °C vs sleep baseline.", delta),
+                                   targetSummary: String(format: "Early baseline · Green within ±%.1f °C, yellow within ±%.1f, red farther from baseline.", safeGreenDelta, safeYellowDelta),
+                                   recommendation: recommendation,
+                                   disclaimer: "Early relative sleep-only signal; not an absolute temperature. \(AtriaMetricZone.nonMedicalDisclaimer)")
+        }
+
+        static func bloodOxygenResearch(candidateFrames: Int,
+                                        goalFrames: Int = 8) -> AtriaMetricZone? {
+            guard candidateFrames > 0 else { return nil }
+            let safeGoal = min(max(goalFrames, 2), 120)
+            let yellowFloor = max(1, safeGoal / 2)
+            let level: AtriaMetricZoneLevel = candidateFrames >= safeGoal ? .green : (candidateFrames >= yellowFloor ? .yellow : .red)
+            let recommendation: String
+            switch level {
+            case .green:
+                recommendation = "Blood oxygen has enough candidate frames to inspect. Atria still does not show an SpO2 percentage until quality checks pass."
+            case .yellow:
+                recommendation = "Blood oxygen has partial candidate evidence. Keep collecting sleep data before trusting this signal."
+            case .red:
+                recommendation = "Blood oxygen has too little candidate evidence. Wear the strap overnight and treat this as an early signal only."
+            }
+            return AtriaMetricZone(level: level,
+                                   title: "Blood oxygen signal evidence",
+                                   current: "\(candidateFrames) candidate frames; not an SpO2 reading.",
+                                   targetSummary: "Signal evidence · Green \(safeGoal)+ candidate frames, yellow \(yellowFloor)-\(safeGoal - 1), red below \(yellowFloor).",
+                                   recommendation: recommendation,
+                                   disclaimer: "Early signal only; no SpO2 percentage, diagnosis, alarm, or Health export. \(AtriaMetricZone.nonMedicalDisclaimer)")
+        }
+    }
+
+    enum Daily {
+        struct StrapStepSample: Equatable {
+            let steps: Int
+            let distanceMeters: Double?
+            let floorsAscended: Int?
+            let floorsDescended: Int?
+        }
+
+        struct StrapStepSummary: Equatable {
+            let steps: Int
+            let distanceMeters: Double?
+            let floorsAscended: Int?
+            let floorsDescended: Int?
+
+            var hasStepEvidence: Bool { steps > 0 }
+        }
+
+        struct HeartRateEnergySample: Equatable {
+            let t: Date
+            let bpm: Int
+        }
+
+        static func stepsDaily(_ samples: [StrapStepSample]) -> StrapStepSummary {
+            var steps = 0
+            var distance = 0.0
+            var hasDistance = false
+            var floorsAscended = 0
+            var hasFloorsAscended = false
+            var floorsDescended = 0
+            var hasFloorsDescended = false
+
+            for sample in samples {
+                steps += max(0, sample.steps)
+                if let meters = sample.distanceMeters, meters > 0 {
+                    distance += meters
+                    hasDistance = true
+                }
+                if let floors = sample.floorsAscended, floors > 0 {
+                    floorsAscended += floors
+                    hasFloorsAscended = true
+                }
+                if let floors = sample.floorsDescended, floors > 0 {
+                    floorsDescended += floors
+                    hasFloorsDescended = true
+                }
+            }
+
+            return StrapStepSummary(steps: steps,
+                                    distanceMeters: hasDistance ? distance : nil,
+                                    floorsAscended: hasFloorsAscended ? floorsAscended : nil,
+                                    floorsDescended: hasFloorsDescended ? floorsDescended : nil)
+        }
+
+        static func dayCalories(_ samples: [HeartRateEnergySample],
+                                rest: Int,
+                                profile: AthleteProfile) -> Double? {
+            guard samples.count > 1, rest > 0, profile.hasEnergyProfile else { return nil }
+            let resting = energyKcalPerMinute(heartRate: rest, profile: profile)
+            var total = 0.0
+            for index in 1..<samples.count {
+                let dtSeconds = samples[index].t.timeIntervalSince(samples[index - 1].t)
+                guard dtSeconds.isFinite, dtSeconds > 0,
+                      dtSeconds <= Strain.maximumLoadEvidenceGap,
+                      Strain.hasPlausibleHeartRateEndpoints(samples[index - 1].bpm, samples[index].bpm) else { continue }
+                let dtMin = dtSeconds / 60.0
+                let gross = energyKcalPerMinute(heartRate: samples[index].bpm, profile: profile)
+                total += max(0, gross - resting) * dtMin
+            }
+            return total
+        }
+
+        private static func energyKcalPerMinute(heartRate: Int, profile: AthleteProfile) -> Double {
+            let hr = Double(heartRate)
+            let weight = profile.weightKg
+            let age = Double(profile.age)
+            switch profile.biologicalSex {
+            case .male:
+                return max(0, (-55.0969 + 0.6309 * hr + 0.1988 * weight + 0.2017 * age) / 4.184)
+            case .female:
+                return max(0, (-20.4022 + 0.4472 * hr - 0.1263 * weight + 0.0740 * age) / 4.184)
+            case .unspecified:
+                return 0
+            }
+        }
+    }
+
+    enum Strain {
+        /// Match the load model's evidence contract. Both endpoints must be
+        /// usable: removing an invalid observation first would bridge its hole.
+        fileprivate static func hasPlausibleHeartRateEndpoints(_ previous: Int, _ current: Int) -> Bool {
+            AtriaStrainLoadModel.plausibleBPMRange.contains(Double(previous))
+                && AtriaStrainLoadModel.plausibleBPMRange.contains(Double(current))
+        }
+
+        /// The single version authority for both the current display curve and
+        /// persisted strain values. Bump whenever stored HR evidence can
+        /// produce a different public 0–21 score, whether the evidence kernel
+        /// or display curve changes. Persisted workout cards use this to
+        /// re-score from their original HR samples exactly once, without
+        /// inventing data for metadata-only rows.
+        static let displayCalibrationVersion = 3
+
+        /// Shared evidence boundary for every cardiovascular-load integrator.
+        /// This matches `SavedSession.workoutContinuityGapLimit`: standard
+        /// 2A37 packets may arrive in short bursts, but a longer absence must
+        /// not become strain, zone time, or calories. Validated archive rows
+        /// are integrated from their own timestamps, not held across a gap.
+        static let maximumLoadEvidenceGap: TimeInterval = 15
+
+        struct MaxHeartRateZoneSeconds: Equatable {
+            let rest: TimeInterval
+            let warmup: TimeInterval
+            let fatBurn: TimeInterval
+            let aerobic: TimeInterval
+            let anaerobic: TimeInterval
+            let max: TimeInterval
+            let droppedGapSeconds: TimeInterval
+
+            static let empty = MaxHeartRateZoneSeconds(rest: 0,
+                                                       warmup: 0,
+                                                       fatBurn: 0,
+                                                       aerobic: 0,
+                                                       anaerobic: 0,
+                                                       max: 0,
+                                                       droppedGapSeconds: 0)
+
+            var isEmpty: Bool {
+                rest + warmup + fatBurn + aerobic + anaerobic + max <= 0
+            }
+
+            var storage: [String: TimeInterval] {
+                var out: [String: TimeInterval] = [:]
+                if rest > 0 { out["rest"] = rest }
+                if warmup > 0 { out["warmup"] = warmup }
+                if fatBurn > 0 { out["fatBurn"] = fatBurn }
+                if aerobic > 0 { out["aerobic"] = aerobic }
+                if anaerobic > 0 { out["anaerobic"] = anaerobic }
+                if max > 0 { out["max"] = max }
+                return out
+            }
+
+            func seconds(forZoneRawValue rawValue: Int) -> TimeInterval {
+                switch rawValue {
+                case 0: return rest
+                case 1: return warmup
+                case 2: return fatBurn
+                case 3: return aerobic
+                case 4: return anaerobic
+                case 5: return max
+                default: return 0
+                }
+            }
+
+            static func + (lhs: Self, rhs: Self) -> Self {
+                Self(rest: lhs.rest + rhs.rest,
+                     warmup: lhs.warmup + rhs.warmup,
+                     fatBurn: lhs.fatBurn + rhs.fatBurn,
+                     aerobic: lhs.aerobic + rhs.aerobic,
+                     anaerobic: lhs.anaerobic + rhs.anaerobic,
+                     max: lhs.max + rhs.max,
+                     droppedGapSeconds: lhs.droppedGapSeconds + rhs.droppedGapSeconds)
+            }
+        }
+
+        struct ZoneSummary: Equatable {
+            let secondsZ0: TimeInterval
+            let secondsZ1: TimeInterval
+            let secondsZ2: TimeInterval
+            let secondsZ3: TimeInterval
+            let secondsZ4: TimeInterval
+            let droppedGapSeconds: TimeInterval
+            let samples: Int
+            let minHRReserve: Double
+            let maxHRReserve: Double
+
+            static let empty = ZoneSummary(secondsZ0: 0,
+                                           secondsZ1: 0,
+                                           secondsZ2: 0,
+                                           secondsZ3: 0,
+                                           secondsZ4: 0,
+                                           droppedGapSeconds: 0,
+                                           samples: 0,
+                                           minHRReserve: 0,
+                                           maxHRReserve: 0)
+
+            var totalSeconds: TimeInterval {
+                secondsZ0 + secondsZ1 + secondsZ2 + secondsZ3 + secondsZ4
+            }
+
+            static func + (lhs: ZoneSummary, rhs: ZoneSummary) -> ZoneSummary {
+                let samples = lhs.samples + rhs.samples
+                let minReserve: Double
+                let maxReserve: Double
+                if lhs.samples == 0 {
+                    minReserve = rhs.minHRReserve
+                    maxReserve = rhs.maxHRReserve
+                } else if rhs.samples == 0 {
+                    minReserve = lhs.minHRReserve
+                    maxReserve = lhs.maxHRReserve
+                } else {
+                    minReserve = min(lhs.minHRReserve, rhs.minHRReserve)
+                    maxReserve = max(lhs.maxHRReserve, rhs.maxHRReserve)
+                }
+                return ZoneSummary(secondsZ0: lhs.secondsZ0 + rhs.secondsZ0,
+                                   secondsZ1: lhs.secondsZ1 + rhs.secondsZ1,
+                                   secondsZ2: lhs.secondsZ2 + rhs.secondsZ2,
+                                   secondsZ3: lhs.secondsZ3 + rhs.secondsZ3,
+                                   secondsZ4: lhs.secondsZ4 + rhs.secondsZ4,
+                                   droppedGapSeconds: lhs.droppedGapSeconds + rhs.droppedGapSeconds,
+                                   samples: samples,
+                                   minHRReserve: minReserve,
+                                   maxHRReserve: maxReserve)
+            }
+        }
+
+        /// Banister TRIMP over a series of (secondsFromStart, bpm) samples.
+        /// Each interval contributes dt · HRr · a · e^(b·HRr), using the
+        /// published sex-specific multiplier and exponent when available.
+        static func trimp(_ series: [(t: Double, bpm: Int)], rest: Int, max: Int) -> Double {
+            cardiovascularLoad(series,
+                               rest: rest,
+                               max: max,
+                               multiplier: 0.64,
+                               coefficient: 1.92,
+                               mode: .workout)
+        }
+
+        static func trimp(_ series: [(t: Double, bpm: Int)],
+                          rest: Int,
+                          max: Int,
+                          sex: AthleteProfile.BiologicalSex) -> Double {
+            let parameters = banisterParameters(for: sex)
+            return cardiovascularLoad(series,
+                                      rest: rest,
+                                      max: max,
+                                      multiplier: parameters.multiplier,
+                                      coefficient: parameters.coefficient,
+                                      mode: .workout)
+        }
+
+        static func trimp(_ series: [(t: Double, bpm: Int)],
+                          rest: Int,
+                          max: Int,
+                          coefficient: Double) -> Double {
+            cardiovascularLoad(series,
+                               rest: rest,
+                               max: max,
+                               multiplier: 0.64,
+                               coefficient: coefficient,
+                               mode: .workout)
+        }
+
+        static func dailyTRIMP(
+            _ series: [(t: Double, bpm: Int)],
+            rest: Int,
+            max: Int,
+            sex: AthleteProfile.BiologicalSex
+        ) -> Double {
+            let parameters = banisterParameters(for: sex)
+            return cardiovascularLoad(series,
+                                      rest: rest,
+                                      max: max,
+                                      multiplier: parameters.multiplier,
+                                      coefficient: parameters.coefficient,
+                                      mode: .continuousDay)
+        }
+
+        private static func cardiovascularLoad(
+            _ series: [(t: Double, bpm: Int)],
+            rest: Int,
+            max: Int,
+            multiplier: Double,
+            coefficient: Double,
+            mode: AtriaStrainLoadModel.Mode
+        ) -> Double {
+            guard series.count > 1 else { return 0 }
+            let configuration = AtriaStrainLoadModel.Configuration(
+                restingBPM: Double(rest),
+                maximumBPM: Double(max),
+                intensityMultiplier: multiplier,
+                intensityCoefficient: coefficient,
+                mode: mode,
+                maximumGap: maximumLoadEvidenceGap
+            )
+            return AtriaStrainLoadModel.calculate(
+                series.lazy.map {
+                    AtriaStrainLoadModel.Sample(timestamp: $0.t, bpm: Double($0.bpm))
+                },
+                configuration: configuration
+            ).load
+        }
+
+        /// Standard max-HR zone seconds for day/workout rollups.
+        /// Buckets mirror HRZone: rest <50%, warmup 50-60%, fat burn 60-70%,
+        /// aerobic 70-80%, anaerobic 80-90%, max >=90% of configured max HR.
+        static func maxHeartRateZoneSeconds(_ series: [(t: Double, bpm: Int)],
+                                            maxHR: Int,
+                                            restingHR: Int? = nil,
+                                            maxGap: TimeInterval = maximumLoadEvidenceGap) -> MaxHeartRateZoneSeconds {
+            guard series.count > 1, maxHR > 0 else { return .empty }
+            var rest = 0.0
+            var warmup = 0.0
+            var fatBurn = 0.0
+            var aerobic = 0.0
+            var anaerobic = 0.0
+            var max = 0.0
+            var dropped = 0.0
+
+            for index in 1..<series.count {
+                let dt = series[index].t - series[index - 1].t
+                guard dt.isFinite, dt > 0 else { continue }
+                if dt > maxGap || !hasPlausibleHeartRateEndpoints(series[index - 1].bpm, series[index].bpm) {
+                    dropped += dt
+                    continue
+                }
+                switch maxHeartRateZoneRawValue(for: series[index].bpm, maxHR: maxHR, restingHR: restingHR) {
+                case 0: rest += dt
+                case 1: warmup += dt
+                case 2: fatBurn += dt
+                case 3: aerobic += dt
+                case 4: anaerobic += dt
+                default: max += dt
+                }
+            }
+
+            return MaxHeartRateZoneSeconds(rest: rest,
+                                           warmup: warmup,
+                                           fatBurn: fatBurn,
+                                           aerobic: aerobic,
+                                           anaerobic: anaerobic,
+                                           max: max,
+                                           droppedGapSeconds: dropped)
+        }
+
+        /// Exact recovered/BG counterpart. The caller-supplied checkpoint is
+        /// also the throttle duty-cycle edge, so the interval walk cannot run
+        /// one full recovered corpus after its ticket or BG generation ends.
+        static func maxHeartRateZoneSeconds(
+            _ series: [(t: Double, bpm: Int)],
+            maxHR: Int,
+            restingHR: Int? = nil,
+            maxGap: TimeInterval = maximumLoadEvidenceGap,
+            shouldContinue: () -> Bool
+        ) -> MaxHeartRateZoneSeconds? {
+            guard shouldContinue(), series.count > 1, maxHR > 0 else {
+                return series.count > 1 && maxHR > 0 ? nil : .empty
+            }
+            var total = MaxHeartRateZoneSeconds.empty
+            for index in 1..<series.count {
+                if index.isMultiple(of: 256), !shouldContinue() { return nil }
+                let dt = series[index].t - series[index - 1].t
+                guard dt.isFinite, dt > 0 else { continue }
+                if dt > maxGap || !hasPlausibleHeartRateEndpoints(series[index - 1].bpm, series[index].bpm) {
+                    total = MaxHeartRateZoneSeconds(
+                        rest: total.rest,
+                        warmup: total.warmup,
+                        fatBurn: total.fatBurn,
+                        aerobic: total.aerobic,
+                        anaerobic: total.anaerobic,
+                        max: total.max,
+                        droppedGapSeconds: total.droppedGapSeconds + dt
+                    )
+                    continue
+                }
+                let zone = maxHeartRateZoneRawValue(
+                    for: series[index].bpm,
+                    maxHR: maxHR,
+                    restingHR: restingHR
+                )
+                total = MaxHeartRateZoneSeconds(
+                    rest: total.rest + (zone == 0 ? dt : 0),
+                    warmup: total.warmup + (zone == 1 ? dt : 0),
+                    fatBurn: total.fatBurn + (zone == 2 ? dt : 0),
+                    aerobic: total.aerobic + (zone == 3 ? dt : 0),
+                    anaerobic: total.anaerobic + (zone == 4 ? dt : 0),
+                    max: total.max + (zone >= 5 ? dt : 0),
+                    droppedGapSeconds: total.droppedGapSeconds
+                )
+            }
+            return shouldContinue() ? total : nil
+        }
+
+        static func maxHeartRateZoneRawValue(for bpm: Int, maxHR: Int, restingHR: Int? = nil) -> Int {
+            guard bpm > 0, maxHR > 0 else { return 0 }
+            let rest = restingHR ?? 0
+            guard maxHR > rest else { return 0 }
+            let fraction = Double(bpm - rest) / Double(maxHR - rest)
+            switch fraction {
+            case 0.90...: return 5
+            case 0.80..<0.90: return 4
+            case 0.70..<0.80: return 3
+            case 0.60..<0.70: return 2
+            case 0.50..<0.60: return 1
+            default: return 0
+            }
+        }
+
+        struct BanisterParameters: Equatable {
+            let multiplier: Double
+            let coefficient: Double
+        }
+
+        static func banisterParameters(for sex: AthleteProfile.BiologicalSex) -> BanisterParameters {
+            switch sex {
+            case .female: return BanisterParameters(multiplier: 0.86, coefficient: 1.67)
+            case .male, .unspecified: return BanisterParameters(multiplier: 0.64, coefficient: 1.92)
+            }
+        }
+
+        static func banisterCoefficient(for sex: AthleteProfile.BiologicalSex) -> Double {
+            banisterParameters(for: sex).coefficient
+        }
+
+        /// Edwards load over HR-reserve zones: 50/60/70/80/90% HRR, weights 1...5.
+        /// This is a second supported strain scorer for calibration and audits.
+        static func edwardsLoad(_ series: [(t: Double, bpm: Int)], rest: Int, max: Int) -> Double {
+            guard series.count > 1, max > rest else { return 0 }
+            let span = Double(max - rest)
+            // maximumLoadEvidenceGap is expressed in SECONDS (shared with the
+            // TRIMP/zone integrators, which compare in seconds); this
+            // integrator works in minutes, so convert once and by name.
+            let maximumGapMinutes = maximumLoadEvidenceGap / 60
+            var total = 0.0
+            for index in 1..<series.count {
+                let dtMin = (series[index].t - series[index - 1].t) / 60.0
+                guard dtMin.isFinite, dtMin > 0,
+                      dtMin <= maximumGapMinutes,
+                      hasPlausibleHeartRateEndpoints(series[index - 1].bpm, series[index].bpm) else { continue }
+                let reserve = Swift.min(Swift.max((Double(series[index].bpm) - Double(rest)) / span, 0), 1)
+                total += dtMin * Double(edwardsWeight(forHRReserve: reserve))
+            }
+            return total
+        }
+
+        static func edwardsWeight(forHRReserve reserve: Double) -> Int {
+            switch reserve {
+            case 0.90...: return 5
+            case 0.80..<0.90: return 4
+            case 0.70..<0.80: return 3
+            case 0.60..<0.70: return 2
+            case 0.50..<0.60: return 1
+            default: return 0
+            }
+        }
+
+        /// Map Edwards' weighted zone-minutes onto the same 0...21 strain surface.
+        static func score(fromEdwardsLoad load: Double) -> Double {
+            guard load > 0 else { return 0 }
+            return min(21.0 * (1 - exp(-load / 65.0)), 21.0)
+        }
+
+        static func activeCalories(_ samples: [HRSample], rest: Int, profile: AthleteProfile) -> Double? {
+            Daily.dayCalories(samples.map { Daily.HeartRateEnergySample(t: $0.t, bpm: $0.bpm) },
+                              rest: rest,
+                              profile: profile)
+        }
+
+        /// Removes explicit pause windows while preserving their boundaries.
+        /// Returning one array of surviving samples is not sufficient: a short
+        /// pause can leave the pre/post samples within the normal telemetry-gap
+        /// tolerance, which would integrate the excluded time back into TRIMP,
+        /// zone seconds, and energy. Each returned segment must be integrated
+        /// independently, then the scalar results may be summed.
+        static func contiguousSegments(_ samples: [HRSample],
+                                       excluding excludedIntervals: [ExcludedInterval]?) -> [[HRSample]] {
+            guard !samples.isEmpty else { return [] }
+            let intervals = normalizedExcludedIntervals(excludedIntervals)
+            guard !intervals.isEmpty else { return [samples] }
+
+            var result: [[HRSample]] = []
+            var current: [HRSample] = []
+            var intervalIndex = 0
+
+            func finishCurrent() {
+                guard !current.isEmpty else { return }
+                result.append(current)
+                current.removeAll(keepingCapacity: true)
+            }
+
+            for sample in samples {
+                while intervalIndex < intervals.count,
+                      sample.t > intervals[intervalIndex].end {
+                    // Crossing a known pause boundary always ends the previous
+                    // integration segment, even when no sample landed inside it.
+                    finishCurrent()
+                    intervalIndex += 1
+                }
+
+                if intervalIndex < intervals.count {
+                    let interval = intervals[intervalIndex]
+                    if sample.t >= interval.start, sample.t <= interval.end {
+                        finishCurrent()
+                        continue
+                    }
+                }
+                current.append(sample)
+            }
+            finishCurrent()
+            return result
+        }
+
+        static func contiguousSegments(
+            _ samples: [HRSample],
+            excluding excludedIntervals: [ExcludedInterval]?,
+            shouldContinue: () -> Bool
+        ) -> [[HRSample]]? {
+            guard shouldContinue() else { return nil }
+            guard !samples.isEmpty else { return [] }
+            var intervals = (excludedIntervals ?? []).filter {
+                $0.end > $0.start
+            }
+            guard AtriaSleepCooperativeAlgorithms.stableSort(
+                &intervals,
+                shouldContinue: shouldContinue,
+                areInIncreasingOrder: { lhs, rhs in
+                    lhs.start == rhs.start
+                        ? lhs.end < rhs.end
+                        : lhs.start < rhs.start
+                }
+            ) else { return nil }
+            var normalized: [ExcludedInterval] = []
+            for (index, interval) in intervals.enumerated() {
+                if index.isMultiple(of: 64), !shouldContinue() { return nil }
+                if let previous = normalized.last,
+                   interval.start <= previous.end {
+                    normalized[normalized.count - 1] = ExcludedInterval(
+                        start: previous.start,
+                        end: max(previous.end, interval.end)
+                    )
+                } else {
+                    normalized.append(interval)
+                }
+            }
+            guard !normalized.isEmpty else {
+                return shouldContinue() ? [samples] : nil
+            }
+            var result: [[HRSample]] = []
+            var current: [HRSample] = []
+            var intervalIndex = 0
+            func finishCurrent() {
+                guard !current.isEmpty else { return }
+                result.append(current)
+                current.removeAll(keepingCapacity: true)
+            }
+            for (index, sample) in samples.enumerated() {
+                if index.isMultiple(of: 256), !shouldContinue() { return nil }
+                while intervalIndex < normalized.count,
+                      sample.t > normalized[intervalIndex].end {
+                    finishCurrent()
+                    intervalIndex += 1
+                }
+                if intervalIndex < normalized.count {
+                    let interval = normalized[intervalIndex]
+                    if sample.t >= interval.start, sample.t <= interval.end {
+                        finishCurrent()
+                        continue
+                    }
+                }
+                current.append(sample)
+            }
+            finishCurrent()
+            return shouldContinue() ? result : nil
+        }
+
+        private static func normalizedExcludedIntervals(
+            _ intervals: [ExcludedInterval]?
+        ) -> [ExcludedInterval] {
+            let ordered = (intervals ?? [])
+                .filter { $0.end > $0.start }
+                .sorted { lhs, rhs in
+                    lhs.start == rhs.start ? lhs.end < rhs.end : lhs.start < rhs.start
+                }
+            guard var current = ordered.first else { return [] }
+            var merged: [ExcludedInterval] = []
+            for interval in ordered.dropFirst() {
+                if interval.start <= current.end {
+                    current = ExcludedInterval(start: current.start,
+                                               end: max(current.end, interval.end))
+                } else {
+                    merged.append(current)
+                    current = interval
+                }
+            }
+            merged.append(current)
+            return merged
+        }
+
+        /// HR-reserve zone seconds for auditing Strain behavior across rest to max.
+        /// Buckets: z0 <30%, z1 30-50%, z2 50-70%, z3 70-85%, z4 >=85% HR reserve.
+        static func zoneSummary(_ series: [(t: Double, bpm: Int)], rest: Int, max: Int) -> ZoneSummary {
+            guard series.count > 1, max > rest else { return .empty }
+            let span = Double(max - rest)
+            var z0 = 0.0, z1 = 0.0, z2 = 0.0, z3 = 0.0, z4 = 0.0
+            var dropped = 0.0
+            var minReserve = 1.0
+            var maxReserve = 0.0
+            var usableSamples = 0
+            for index in 1..<series.count {
+                let dt = series[index].t - series[index - 1].t
+                guard dt.isFinite, dt > 0 else { continue }
+                if dt > maximumLoadEvidenceGap || !hasPlausibleHeartRateEndpoints(series[index - 1].bpm, series[index].bpm) {
+                    dropped += dt
+                    continue
+                }
+                let reserve = Swift.min(Swift.max((Double(series[index].bpm) - Double(rest)) / span, 0), 1)
+                minReserve = Swift.min(minReserve, reserve)
+                maxReserve = Swift.max(maxReserve, reserve)
+                usableSamples += 1
+                switch reserve {
+                case ..<0.30: z0 += dt
+                case ..<0.50: z1 += dt
+                case ..<0.70: z2 += dt
+                case ..<0.85: z3 += dt
+                default: z4 += dt
+                }
+            }
+            guard usableSamples > 0 else {
+                return ZoneSummary(secondsZ0: 0,
+                                   secondsZ1: 0,
+                                   secondsZ2: 0,
+                                   secondsZ3: 0,
+                                   secondsZ4: 0,
+                                   droppedGapSeconds: dropped,
+                                   samples: 0,
+                                   minHRReserve: 0,
+                                   maxHRReserve: 0)
+            }
+            return ZoneSummary(secondsZ0: z0,
+                               secondsZ1: z1,
+                               secondsZ2: z2,
+                               secondsZ3: z3,
+                               secondsZ4: z4,
+                               droppedGapSeconds: dropped,
+                               samples: usableSamples,
+                               minHRReserve: minReserve,
+                               maxHRReserve: maxReserve)
+        }
+
+        /// Map cumulative TRIMP to the 0–21 strain scale (saturating exponential).
+        ///
+        /// The 0–21 display curve is calibrated separately from the Banister
+        /// evidence integral.  A prior /250 mapping avoided saturation but made
+        /// verified sustained training look implausibly light: a recent 64-minute
+        /// strength window with 3,820 observed HR seconds, mean HR 131, peak 170,
+        /// and TRIMP 65.6 displayed as only 4.85.  The same session should land in
+        /// the moderate training range (about 7–9 once its adjacent cycling and
+        /// walk are included), not be treated like a short easy walk.  /150 gives
+        /// that observed session 7.44 while retaining the logarithmic shape and
+        /// still requiring substantially more work to climb 10→20 than 0→10.
+        ///
+        /// This changes only how measured TRIMP is *presented*; it neither fills
+        /// telemetry gaps nor adds activity-specific or estimated load.
+        static func score(fromTRIMP trimp: Double) -> Double {
+            AtriaStrainLoadModel.displayScore(fromLoad: trimp)
+        }
+
+    }
+
+    enum Recovery {
+        struct Estimate: Equatable {
+            enum Confidence: String {
+                case learning
+                case unverified
+                case personalBaseline = "personal baseline"
+                case validated
+            }
+
+            struct Contributor: Equatable, Identifiable {
+                enum Kind: String, Equatable {
+                    case hrv
+                    case restingHeartRate
+                    case sleep
+                    case respiration
+                }
+
+                let kind: Kind
+                let zScore: Double
+                let weight: Double
+                let detail: String
+                let displayValue: String
+                let direction: Int
+
+                var id: String { kind.rawValue }
+                var weightedContribution: Double { zScore * weight }
+
+                init(kind: Kind,
+                     zScore: Double,
+                     weight: Double,
+                     detail: String,
+                     displayValue: String? = nil,
+                     direction: Int? = nil) {
+                    self.kind = kind
+                    self.zScore = zScore
+                    self.weight = weight
+                    self.detail = detail
+                    self.displayValue = displayValue ?? String(format: "%+.1fσ", zScore)
+                    if let direction {
+                        self.direction = min(max(direction, -1), 1)
+                    } else if zScore > 0.12 {
+                        self.direction = 1
+                    } else if zScore < -0.12 {
+                        self.direction = -1
+                    } else {
+                        self.direction = 0
+                    }
+                }
+            }
+
+            let percent: Int?
+            let confidence: Confidence
+            let usesHRV: Bool
+            let detail: String
+            let contributors: [Contributor]
+        }
+
+        /// HR-only recovery: at/below baseline reads high; elevated resting reads low.
+        static func restingOnly(restingNow: Int, baseline: Int) -> Int {
+            guard restingNow > 0, baseline > 0 else { return 0 }
+            let delta = Double(restingNow - baseline)
+            return Int(min(max(75 - delta * 5, 1), 99).rounded())
+        }
+
+        /// HRV-driven recovery (the primary signal), blended with resting HR.
+        static func estimate(hrvNow: Int, hrvBaseline: Int, restingNow: Int, restingBaseline: Int) -> Int {
+            guard hrvNow > 0, hrvBaseline > 0 else {
+                return restingOnly(restingNow: restingNow, baseline: restingBaseline)
+            }
+            let hrvScore = 66.0 * Double(hrvNow) / Double(hrvBaseline)
+            let restingPenalty = restingNow > 0 && restingBaseline > 0
+                ? 3.0 * Double(restingNow - restingBaseline) : 0
+            return Int(min(max(hrvScore - restingPenalty, 1), 99).rounded())
+        }
+
+        /// Recovery v2: logistic personal z-score model. HRV is the primary signal,
+        /// resting HR is inverted, sleep contributes once saved, and respiration is
+        /// neutral until a trusted respiratory baseline exists.
+        static func estimate(hrvSnapshot: HRVSnapshot?,
+                             fallbackRMSSD: Int?,
+                             restingNow: Int?,
+                             baseline: PersonalBaseline,
+                             hrvReferenceValidated: Bool = false,
+                             sleepEfficiency: Double? = nil,
+                             sleepDurationHours: Double? = nil,
+                             sleepBaseline: SleepBaselineStats? = nil,
+                             respiratoryRate: Double? = nil,
+                             respiratoryBaseline: (mean: Double, sd: Double, count: Int)? = nil,
+                             now: Date = Date()) -> Estimate {
+            guard let (sleepZ, sleepIsPersonal) = sleepRecoveryZ(efficiency: sleepEfficiency,
+                                                                 durationHours: sleepDurationHours,
+                                                                 sleepBaseline: sleepBaseline) else {
+                // Sleep missing but HRV/RHR baselines trusted: renormalize the
+                // weights and score at reduced confidence instead of refusing —
+                // one night of missed sleep capture must not blank recovery.
+                if let restingNow,
+                   let renormalized = sleepMissingEstimate(hrvSnapshot: hrvSnapshot,
+                                                           fallbackRMSSD: fallbackRMSSD,
+                                                           restingNow: restingNow,
+                                                           baseline: baseline,
+                                                           respiratoryRate: respiratoryRate,
+                                                           respiratoryBaseline: respiratoryBaseline,
+                                                           now: now) {
+                    return renormalized
+                }
+                if let restingNow,
+                   let restingOnly = limitedEvidenceEstimateWithoutSleepOrHRV(
+                    restingNow: restingNow,
+                    baseline: baseline
+                   ) {
+                    return restingOnly
+                }
+                return Estimate(percent: nil, confidence: .learning,
+                                usesHRV: true,
+                                detail: "learning: need saved sleep",
+                                contributors: [])
+            }
+
+            // Day-one recovery must be useful without pretending that an HRV
+            // measurement exists. A confirmed sleep supplies a real, bounded
+            // duration/efficiency signal immediately. Add RHR only when both a
+            // current value and an honest comparator exist, then disclose the
+            // missing primary signal with zero weight. Qualified HRV below
+            // upgrades this provisional result to the full personal model.
+            let rmssdNow = hrvSnapshot?.isReady == true
+                ? hrvSnapshot?.rmssd
+                : fallbackRMSSD.map(Double.init)
+            guard let rmssdNow, rmssdNow > 0 else {
+                return limitedEvidenceEstimateWithoutHRV(
+                    sleepZ: sleepZ,
+                    sleepIsPersonal: sleepIsPersonal,
+                    sleepDurationHours: sleepDurationHours,
+                    restingNow: restingNow,
+                    baseline: baseline,
+                    respiratoryRate: respiratoryRate,
+                    respiratoryBaseline: respiratoryBaseline
+                )
+            }
+
+            // Resting HR sharpens recovery but is not required: HRV (the primary
+            // 60% signal) plus a confirmed sleep already support a reduced-
+            // confidence estimate. When restingNow is absent, drop ONLY the resting
+            // term and renormalize the blend below, rather than hiding recovery
+            // entirely (#4, 2026-08-22 — previously this returned .learning). A
+            // present restingNow keeps the full model — and its own
+            // baseline-not-ready learning state — exactly as before; the blend
+            // arithmetic is unchanged when restingZ != nil.
+            let hasTrustedRestingBaseline = baseline.hasTrustedRestingBaseline()
+            let restingZ: Double?
+            if let restingNow {
+                let restingStats: (mean: Double, sd: Double, count: Int)
+                if hasTrustedRestingBaseline, let stats = baseline.restingStats {
+                    restingStats = stats
+                } else if let restingBaseline = baseline.restingHR, restingBaseline > 0 {
+                    restingStats = (mean: restingBaseline,
+                                    sd: max(baseline.restingStats?.sd ?? 0, 5),
+                                    count: baseline.freshRestingSampleCount())
+                } else {
+                    return Estimate(percent: nil, confidence: .learning,
+                                    usesHRV: false,
+                                    detail: "learning RHR baseline \(baseline.freshRestingSampleCount())/\(PersonalBaseline.trustedMinimumSamples)",
+                                    contributors: [])
+                }
+                restingZ = zScore(Double(restingNow), mean: restingStats.mean, sd: restingStats.sd, minSD: 1.0)
+            } else {
+                restingZ = nil
+            }
+
+            let hrvStats = baseline.lnRMSSDStats
+            let hasTrustedHRVBaseline = baseline.hasTrustedHRVBaseline()
+                && (hrvStats?.count ?? 0) >= PersonalBaseline.trustedMinimumSamples
+            // Recovery model v4 (assessment P1.6): prefer the robust 30-day
+            // median + scaled-MAD receipt as the lnRMSSD comparator — one
+            // alcohol night must not explode the band. The EMA mean/sd stays
+            // as the fallback while the receipt is untrusted.
+            let robustComparison = baseline.recoveryComparison(now: now)
+            let hrvZ: Double
+            var confidence: Estimate.Confidence
+            let hrvDetail: String
+            if hasTrustedHRVBaseline, robustComparison.hrvTrusted,
+               let robustHRV = robustComparison.hrv {
+                hrvZ = zScore(log(rmssdNow),
+                              mean: robustHRV.location,
+                              sd: robustHRV.scale,
+                              minSD: 0.05)
+                confidence = hasTrustedRestingBaseline ? .personalBaseline : .unverified
+                hrvDetail = String(format: "HRV %.1fσ vs 30-day median", hrvZ)
+            } else if hasTrustedHRVBaseline, let hrvStats {
+                hrvZ = zScore(log(rmssdNow), mean: hrvStats.mean, sd: hrvStats.sd, minSD: 0.05)
+                if hasTrustedRestingBaseline {
+                    // 2026-08-14 (assessment P0.3): `.validated` is RESERVED
+                    // for a held-out outcome study of the Recovery model.
+                    // RR reference validation proves the HRV *measurement*
+                    // against a reference device — it does not prove this
+                    // score predicts readiness, so it must not upgrade the
+                    // tier. The strongest production claim is a personal
+                    // baseline. (`hrvReferenceValidated` still gates HealthKit
+                    // HRV writes and measurement copy elsewhere.)
+                    confidence = .personalBaseline
+                } else {
+                    confidence = .unverified
+                }
+                hrvDetail = String(format: "HRV %.1fσ", hrvZ)
+            } else if let hrvEMA = baseline.hrvEMA, hrvEMA > 0 {
+                hrvZ = 0.25 * max(-2.5, min(2.5, log(rmssdNow / hrvEMA)))
+                confidence = .unverified
+                hrvDetail = String(format: "HRV provisional %.1fσ", hrvZ)
+            } else {
+                // A current RMSSD without any comparator is evidence awaiting
+                // calibration, not a neutral 60%-weight recovery signal.
+                return limitedEvidenceEstimateWithoutHRV(
+                    sleepZ: sleepZ,
+                    sleepIsPersonal: sleepIsPersonal,
+                    sleepDurationHours: sleepDurationHours,
+                    restingNow: restingNow,
+                    baseline: baseline,
+                    respiratoryRate: respiratoryRate,
+                    respiratoryBaseline: respiratoryBaseline
+                )
+            }
+
+            // Recovery model v4 (assessment P0.5): a population-normed sleep
+            // term can never sit inside a personal-baseline-tier score. Until
+            // the wearer's own 14-night sleep baseline exists, the tier caps
+            // at unverified while the score itself stays useful.
+            if !sleepIsPersonal, confidence == .personalBaseline {
+                confidence = .unverified
+            }
+            // Without a current resting reading the score is a reduced-input
+            // estimate; never claim the personal-baseline tier (#4, 2026-08-22).
+            if restingZ == nil, confidence == .personalBaseline {
+                confidence = .unverified
+            }
+            let respirationZ = respiratoryRecoveryZ(rate: respiratoryRate,
+                                                    baseline: respiratoryBaseline)
+            let respirationQualified = hasQualifiedRespiratoryEvidence(
+                rate: respiratoryRate,
+                baseline: respiratoryBaseline
+            )
+            // Renormalize across the signals actually observed. With resting
+            // present this is byte-identical to the prior fixed 0.95(+0.05) blend;
+            // with resting absent the 0.20 term drops out and the remaining
+            // weights renormalize so a missing RHR neither hides recovery nor
+            // silently acts as a neutral measurement (#4, 2026-08-22).
+            let restingObserved = restingZ != nil
+            let restingZValue = restingZ ?? 0
+            let observedWeight = 0.60 + 0.15
+                + (restingObserved ? 0.20 : 0)
+                + (respirationQualified ? 0.05 : 0)
+            let hrvWeight = 0.60 / observedWeight
+            let restingWeight = restingObserved ? 0.20 / observedWeight : 0
+            let sleepWeight = 0.15 / observedWeight
+            let respirationWeight = respirationQualified ? 0.05 / observedWeight : 0
+            let contributors = [
+                Estimate.Contributor(kind: .hrv,
+                                     zScore: hrvZ,
+                                     weight: hrvWeight,
+                                     detail: hrvDetail,
+                                     displayValue: String(format: "HRV %+.1fσ", hrvZ)),
+                Estimate.Contributor(kind: .restingHeartRate,
+                                     zScore: restingObserved ? -restingZValue : 0,
+                                     weight: restingWeight,
+                                     detail: restingObserved
+                                        ? String(format: "RHR %.1fσ", -restingZValue)
+                                        : "RHR unavailable; excluded",
+                                     displayValue: restingObserved
+                                        ? String(format: "Resting HR %+.1fσ", -restingZValue)
+                                        : "Resting HR unavailable",
+                                     direction: restingObserved ? nil : 0),
+                Estimate.Contributor(kind: .sleep,
+                                     zScore: sleepZ,
+                                     weight: sleepWeight,
+                                     // v4: personal median when trusted; the
+                                     // population anchor stays disclosed (and
+                                     // tier-capped) while calibrating.
+                                     detail: sleepIsPersonal
+                                        ? String(format: "Sleep %.1fσ vs your median", sleepZ)
+                                        : String(format: "Sleep %.1fσ vs 7h·85%% norm · calibrating", sleepZ),
+                                     displayValue: sleepDurationHours.map { "\(AtriaMetricFormat.sleepHours($0)) ✓" } ?? String(format: "Sleep %+.1fσ", sleepZ)),
+                Estimate.Contributor(kind: .respiration,
+                                     zScore: respirationZ,
+                                     weight: respirationWeight,
+                                     detail: !respirationQualified
+                                        ? "Resp unavailable; excluded"
+                                        : (respirationZ == 0
+                                           ? "Resp neutral"
+                                           : String(format: "Resp %.1fσ", respirationZ)),
+                                     displayValue: !respirationQualified
+                                        ? "Respiration unavailable"
+                                        : (respirationZ == 0
+                                           ? "Respiration typical"
+                                           : String(format: "Respiration %+.1fσ", respirationZ)),
+                                     direction: respirationQualified ? nil : 0)
+            ]
+            let blendedZ = (
+                0.60 * hrvZ
+                    - (restingObserved ? 0.20 * restingZValue : 0)
+                    + 0.15 * sleepZ
+                    + (respirationQualified ? 0.05 * respirationZ : 0)
+            ) / observedWeight
+            let percent = logisticRecoveryPercent(z: blendedZ)
+            let respirationDetail = !respirationQualified
+                ? "Resp unavailable"
+                : (respirationZ == 0
+                   ? "Resp neutral"
+                   : String(format: "Resp z %.1f", respirationZ))
+            let restingDetail = restingObserved
+                ? String(format: "RHR z %.1f", restingZValue)
+                : "RHR n/a"
+            return Estimate(percent: percent, confidence: confidence,
+                            usesHRV: true,
+                            detail: String(format: "lnRMSSD z %.1f · %@ · Sleep z %.1f · %@", hrvZ, restingDetail, sleepZ, respirationDetail),
+                            contributors: contributors)
+        }
+
+        /// Day-one last resort. A real current resting reading compared with a
+        /// real local resting baseline is enough to show a useful number, but
+        /// never enough to call it validated recovery. Missing sleep and HRV
+        /// remain explicit zero-weight contributors instead of silently acting
+        /// neutral or blanking the product indefinitely.
+        private static func limitedEvidenceEstimateWithoutSleepOrHRV(
+            restingNow: Int,
+            baseline: PersonalBaseline
+        ) -> Estimate? {
+            guard restingNow > 0,
+                  let restingBaseline = baseline.restingHR,
+                  restingBaseline > 0 else { return nil }
+            let stats = baseline.restingStats
+            let restingZ = zScore(Double(restingNow),
+                                  mean: stats?.mean ?? restingBaseline,
+                                  sd: stats?.sd ?? 5,
+                                  minSD: 1)
+            // Do not renormalize a lone secondary signal to 100% of the model.
+            // RHR normally owns 20% of Recovery; letting it own the whole score
+            // made a narrow early baseline turn one low reading into a green
+            // 99 even when both sleep and HRV were absent. Missing contributors
+            // remain neutral, so this is useful on day one without presenting
+            // one-signal certainty.
+            let restingWeight = 0.20
+            return Estimate(
+                percent: logisticRecoveryPercent(z: restingWeight * -restingZ),
+                confidence: .unverified,
+                usesHRV: false,
+                // Plain-language pass (2026-07-31 device review): keep the
+                // load-bearing "HRV unavailable" phrase (overview sniffs it),
+                // but state the evidence and the next step in plain words.
+                // 2026-09-27 (owner: "Limited confidence … is bogus, just show
+                // whatever is observed"): the line says what it is built from.
+                detail: "From resting HR only · sleep and HRV unavailable",
+                contributors: [
+                    Estimate.Contributor(kind: .hrv,
+                                         zScore: 0,
+                                         weight: 0,
+                                         detail: "HRV unavailable; excluded",
+                                         displayValue: "HRV unavailable",
+                                         direction: 0),
+                    Estimate.Contributor(kind: .restingHeartRate,
+                                         zScore: -restingZ,
+                                         weight: restingWeight,
+                                         detail: String(format: "RHR %.1fσ", -restingZ),
+                                         displayValue: "Resting HR \(restingNow) bpm"),
+                    Estimate.Contributor(kind: .sleep,
+                                         zScore: 0,
+                                         weight: 0,
+                                         detail: "Sleep unavailable; excluded",
+                                         displayValue: "Sleep unavailable",
+                                         direction: 0)
+                ]
+            )
+        }
+
+        /// Honest day-one recovery. The score is never labeled baseline or
+        /// validated and HRV contributes exactly zero. Sleep is always present
+        /// here; RHR/respiration join only with real comparison evidence. The
+        /// weights are renormalized across what was actually observed so the
+        /// absent signals cannot silently act as neutral measurements.
+        private static func limitedEvidenceEstimateWithoutHRV(
+            sleepZ: Double,
+            sleepIsPersonal: Bool = false,
+            sleepDurationHours: Double?,
+            restingNow: Int?,
+            baseline: PersonalBaseline,
+            respiratoryRate: Double?,
+            respiratoryBaseline: (mean: Double, sd: Double, count: Int)?
+        ) -> Estimate {
+            var weightedZ = 0.75 * sleepZ
+            var observedWeight = 0.75
+            var contributors = [
+                Estimate.Contributor(
+                    kind: .hrv,
+                    zScore: 0,
+                    weight: 0,
+                    detail: "HRV unavailable; excluded from this estimate",
+                    displayValue: "HRV unavailable",
+                    direction: 0
+                ),
+                Estimate.Contributor(
+                    kind: .sleep,
+                    zScore: sleepZ,
+                    weight: 0.75,
+                    detail: sleepIsPersonal
+                        ? String(format: "Sleep %.1fσ vs your median", sleepZ)
+                        : String(format: "Sleep %.1fσ vs 7h·85%% norm · calibrating", sleepZ),
+                    displayValue: sleepDurationHours.map {
+                        "\(AtriaMetricFormat.sleepHours($0)) · measured"
+                    } ?? String(format: "Sleep %+.1fσ", sleepZ)
+                )
+            ]
+
+            if let restingNow,
+               let restingBaseline = baseline.restingHR,
+               restingBaseline > 0 {
+                let stats = baseline.restingStats
+                let restingZ = zScore(
+                    Double(restingNow),
+                    mean: stats?.mean ?? restingBaseline,
+                    sd: stats?.sd ?? 5,
+                    minSD: 1
+                )
+                weightedZ += 0.20 * -restingZ
+                observedWeight += 0.20
+                contributors.append(Estimate.Contributor(
+                    kind: .restingHeartRate,
+                    zScore: -restingZ,
+                    weight: 0.20,
+                    detail: String(format: "RHR %.1fσ", -restingZ),
+                    displayValue: "Resting HR \(restingNow) bpm"
+                ))
+            }
+
+            let respirationZ = respiratoryRecoveryZ(
+                rate: respiratoryRate,
+                baseline: respiratoryBaseline
+            )
+            if respiratoryRate != nil, respirationZ != 0 {
+                weightedZ += 0.05 * respirationZ
+                observedWeight += 0.05
+                contributors.append(Estimate.Contributor(
+                    kind: .respiration,
+                    zScore: respirationZ,
+                    weight: 0.05,
+                    detail: String(format: "Resp %.1fσ", respirationZ),
+                    displayValue: String(format: "Respiration %+.1fσ", respirationZ)
+                ))
+            }
+
+            let blendedZ = weightedZ / observedWeight
+            return Estimate(
+                percent: logisticRecoveryPercent(z: blendedZ),
+                confidence: .unverified,
+                usesHRV: false,
+                detail: "Sleep-led estimate · HRV unavailable",
+                contributors: contributors
+            )
+        }
+
+        /// Sleep-missing path: requires BOTH trusted baselines, then blends
+        /// HRV/RHR and, only when qualified, respiration with weights
+        /// renormalized over the evidence that actually exists. Confidence is
+        /// capped at .unverified so reduced evidence stays explicit.
+        private static func sleepMissingEstimate(hrvSnapshot: HRVSnapshot?,
+                                                 fallbackRMSSD: Int?,
+                                                 restingNow: Int,
+                                                 baseline: PersonalBaseline,
+                                                 respiratoryRate: Double?,
+                                                 respiratoryBaseline: (mean: Double, sd: Double, count: Int)?,
+                                                 now: Date = Date()) -> Estimate? {
+            guard baseline.hasTrustedRestingBaseline(),
+                  baseline.hasTrustedHRVBaseline(),
+                  let restingStats = baseline.restingStats,
+                  let hrvStats = baseline.lnRMSSDStats,
+                  hrvStats.count >= PersonalBaseline.trustedMinimumSamples else { return nil }
+            let rmssdNow = hrvSnapshot?.isReady == true
+                ? hrvSnapshot?.rmssd
+                : fallbackRMSSD.map(Double.init)
+            guard let rmssdNow, rmssdNow > 0 else { return nil }
+
+            let restingZ = zScore(Double(restingNow), mean: restingStats.mean, sd: restingStats.sd, minSD: 1.0)
+            // v4 (assessment P1.6): same robust-comparator preference as the
+            // full model path.
+            let robustComparison = baseline.recoveryComparison(now: now)
+            let hrvZ: Double
+            if robustComparison.hrvTrusted, let robustHRV = robustComparison.hrv {
+                hrvZ = zScore(log(rmssdNow), mean: robustHRV.location, sd: robustHRV.scale, minSD: 0.05)
+            } else {
+                hrvZ = zScore(log(rmssdNow), mean: hrvStats.mean, sd: hrvStats.sd, minSD: 0.05)
+            }
+            let respirationZ = respiratoryRecoveryZ(rate: respiratoryRate,
+                                                    baseline: respiratoryBaseline)
+            let respirationQualified = hasQualifiedRespiratoryEvidence(
+                rate: respiratoryRate,
+                baseline: respiratoryBaseline
+            )
+            let observedWeight = 0.80 + (respirationQualified ? 0.05 : 0)
+            let blendedZ = (
+                0.60 * hrvZ
+                    - 0.20 * restingZ
+                    + (respirationQualified ? 0.05 * respirationZ : 0)
+            ) / observedWeight
+            let percent = logisticRecoveryPercent(z: blendedZ)
+            let contributors = [
+                Estimate.Contributor(kind: .hrv,
+                                     zScore: hrvZ,
+                                     weight: 0.60 / observedWeight,
+                                     detail: String(format: "HRV %.1fσ", hrvZ),
+                                     displayValue: String(format: "HRV %+.1fσ", hrvZ)),
+                Estimate.Contributor(kind: .restingHeartRate,
+                                     zScore: -restingZ,
+                                     weight: 0.20 / observedWeight,
+                                     detail: String(format: "RHR %.1fσ", -restingZ),
+                                     displayValue: String(format: "Resting HR %+.1fσ", -restingZ)),
+                Estimate.Contributor(kind: .sleep,
+                                     zScore: 0,
+                                     weight: 0,
+                                     detail: "Sleep missing",
+                                     displayValue: "Sleep not captured"),
+                Estimate.Contributor(kind: .respiration,
+                                     zScore: respirationZ,
+                                     weight: respirationQualified ? 0.05 / observedWeight : 0,
+                                     detail: !respirationQualified
+                                        ? "Resp unavailable; excluded"
+                                        : (respirationZ == 0
+                                           ? "Resp neutral"
+                                           : String(format: "Resp %.1fσ", respirationZ)),
+                                     displayValue: !respirationQualified
+                                        ? "Respiration unavailable"
+                                        : (respirationZ == 0
+                                           ? "Respiration typical"
+                                           : String(format: "Respiration %+.1fσ", respirationZ)),
+                                     direction: respirationQualified ? nil : 0)
+            ]
+            return Estimate(percent: percent,
+                            confidence: .unverified,
+                            usesHRV: true,
+                            detail: String(format: "sleep missing · renormalized · lnRMSSD z %.1f · RHR z %.1f", hrvZ, restingZ),
+                            contributors: contributors)
+        }
+
+        private static func zScore(_ value: Double, mean: Double, sd: Double) -> Double {
+            guard sd > 0.1 else { return 0 }
+            return (value - mean) / sd
+        }
+
+        /// Floors the SD instead of returning a hard 0: a genuinely consistent user
+        /// (legit lnRMSSD sd < 0.1) must still get a real z, not a recovery score
+        /// pinned to the logistic midpoint. The clamp bounds the one-time jump for
+        /// users whose z was previously zeroed.
+        private static func zScore(_ value: Double, mean: Double, sd: Double, minSD: Double) -> Double {
+            let effective = max(sd, minSD)
+            guard effective > 0 else { return 0 }
+            return min(max((value - mean) / effective, -2.5), 2.5)
+        }
+
+        private static func logisticRecoveryPercent(z: Double) -> Int {
+            let k = 1.6
+            let z0 = -0.20
+            let raw = 100.0 / (1.0 + exp(-k * (z - z0)))
+            return Int(min(max(raw, 1), 99).rounded())
+        }
+
+        typealias SleepBaselineStats = (hours: (location: Double, scale: Double, count: Int)?,
+                                        efficiency: (location: Double, scale: Double, count: Int)?)
+
+        /// Recovery model v4 (assessment P0.5): the sleep term compares the
+        /// night to the wearer's OWN robust baseline (median + scaled MAD,
+        /// 14-night trust) when one exists. Below trust it falls back to the
+        /// population 7 h / 85% anchors, and the caller must then cap the
+        /// tier at `.unverified` — a population constant can never sit inside
+        /// a "personal baseline"-tier score.
+        private static func sleepRecoveryZ(efficiency: Double?,
+                                           durationHours: Double?,
+                                           sleepBaseline: SleepBaselineStats?) -> (z: Double, personal: Bool)? {
+            if let sleepBaseline {
+                var components: [Double] = []
+                if let durationHours, durationHours > 0, let hours = sleepBaseline.hours {
+                    // MinSD floors mirror the HRV/RHR rules: a genuinely
+                    // regular sleeper still gets a real z, not a pinned zero.
+                    components.append((durationHours - hours.location) / max(hours.scale, 0.75))
+                }
+                if let efficiency, let eff = sleepBaseline.efficiency {
+                    components.append((min(max(efficiency, 0), 1) - eff.location) / max(eff.scale, 0.05))
+                }
+                if !components.isEmpty {
+                    let average = components.reduce(0, +) / Double(components.count)
+                    return (min(max(average, -2), 2), true)
+                }
+            }
+            return populationSleepRecoveryZ(efficiency: efficiency,
+                                            durationHours: durationHours).map { ($0, false) }
+        }
+
+        private static func populationSleepRecoveryZ(efficiency: Double?, durationHours: Double?) -> Double? {
+            var components: [Double] = []
+            if let efficiency {
+                components.append((min(max(efficiency, 0), 1) - 0.85) / 0.10)
+            }
+            if let durationHours, durationHours > 0 {
+                let capped = min(max(durationHours, 0), 9)
+                components.append((capped - 7.0) / 1.5)
+            }
+            guard !components.isEmpty else { return nil }
+            let average = components.reduce(0, +) / Double(components.count)
+            return min(max(average, -2), 2)
+        }
+
+        private static func respiratoryRecoveryZ(rate: Double?,
+                                                 baseline: (mean: Double, sd: Double, count: Int)?) -> Double {
+            guard hasQualifiedRespiratoryEvidence(rate: rate, baseline: baseline),
+                  let rate,
+                  let baseline else { return 0 }
+            return min(max(-zScore(rate, mean: baseline.mean, sd: baseline.sd), -2), 2)
+        }
+
+        private static func hasQualifiedRespiratoryEvidence(
+            rate: Double?,
+            baseline: (mean: Double, sd: Double, count: Int)?
+        ) -> Bool {
+            guard let rate,
+                  rate > 0,
+                  let baseline,
+                  baseline.count >= PersonalBaseline.trustedMinimumSamples,
+                  baseline.sd > 0.1 else { return false }
+            return true
+        }
+    }
+
+    enum VO2Max {
+        /// The HR-ratio estimate is useful before the resting baseline is mature,
+        /// but must not be presented with the same confidence as a trusted
+        /// 14-day baseline. 2026-08-22 user directive ("show insights in the best
+        /// possible way with everything"): publish a visibly preliminary estimate
+        /// as soon as a single qualified resting-HR day exists, rather than
+        /// waiting a week. Confidence still rises to "rough estimate" at the
+        /// trusted 14-day baseline.
+        private static let preliminaryMinimumRestingSamples = 1
+
+        static func summary(rest: Int,
+                            maxHR: Int,
+                            restingSamples: Int,
+                            maxHRMeasured: Bool,
+                            restingTrend: [Int]) -> VO2MaxEstimateSummary {
+            guard rest > 0, maxHR > rest else {
+                return learning(detail: "Need RHR",
+                                narrative: "Atria needs resting HR and HRmax before estimating VO2max.",
+                                trendDetail: "Needs resting baseline.")
+            }
+            guard restingSamples >= preliminaryMinimumRestingSamples else {
+                return learning(detail: "\(restingSamples)/\(PersonalBaseline.trustedMinimumSamples) RHR",
+                                narrative: "Atria needs \(preliminaryMinimumRestingSamples) qualified resting-HR days before showing a preliminary VO2max estimate.",
+                                trendDetail: "\(restingSamples)/\(PersonalBaseline.trustedMinimumSamples) RHR days.")
+            }
+            // 2026-08-21 user directive ("do the best with what we have"): show a
+            // best-effort VO2max even from an age-estimated HRmax rather than
+            // gating it away behind "Need HRmax". The Uth-Sørensen estimate
+            // (15.3·HRmax/RHR) works with any HRmax; a *measured* max simply
+            // raises confidence. This was the single highest-impact blocker — a
+            // measured HRmax rarely exists, so VO2max (and the Fitness Age that
+            // depends on it) was nil for almost everyone.
+            let boundedEstimate = boundedEstimate(rest: rest, maxHR: maxHR)
+            let baselineIsTrusted = restingSamples >= PersonalBaseline.trustedMinimumSamples
+            let confidence: String
+            let narrative: String
+            if maxHRMeasured {
+                confidence = baselineIsTrusted ? "rough estimate" : "preliminary"
+                narrative = baselineIsTrusted
+                    ? "Rough estimate from measured max HR and resting baseline."
+                    : "\(restingSamples)/\(PersonalBaseline.trustedMinimumSamples) qualified RHR days · preliminary estimate from measured max HR."
+            } else {
+                confidence = "estimate"
+                narrative = baselineIsTrusted
+                    ? "Estimate from your resting baseline and an age-based max HR. A hard max-effort workout sharpens it."
+                    : "\(restingSamples)/\(PersonalBaseline.trustedMinimumSamples) qualified RHR days · early estimate from an age-based max HR."
+            }
+            let detail = "\(confidence) · RHR \(rest) · HRmax \(maxHR)\(maxHRMeasured ? "" : " (est.)")"
+            let trend = trendText(currentEstimate: boundedEstimate,
+                                  maxHR: maxHR,
+                                  restingTrend: restingTrend)
+            return VO2MaxEstimateSummary(value: boundedEstimate,
+                                         confidence: confidence,
+                                         detail: detail,
+                                         narrative: narrative,
+                                         trendText: trend.text,
+                                         trendDetail: trend.detail,
+                                         trendDelta: trend.delta,
+                                         // 2026-07-31: surfaces show real
+                                         // "day N of 14" progress while the
+                                         // resting baseline is still maturing.
+                                         preliminaryRestingDayCount: baselineIsTrusted ? nil : restingSamples)
+        }
+
+        static func estimate(rest: Int, maxHR: Int) -> Double? {
+            guard rest > 0, maxHR > rest else { return nil }
+            return boundedEstimate(rest: rest, maxHR: maxHR)
+        }
+
+        static func trendText(currentEstimate: Double,
+                              maxHR: Int,
+                              restingTrend: [Int]) -> (text: String, detail: String, delta: Double?) {
+            let rests = restingTrend.filter { $0 > 0 }
+            guard rests.count >= 2, let oldestRest = rests.first else {
+                return ("Learning", "Needs 2 cached RHR points.", nil)
+            }
+            // Compare against the older-half mean, not the single oldest point —
+            // one noisy cached RHR reading must not decide the trend direction.
+            let half = max(1, rests.count / 2)
+            let olderMean = half == 1
+                ? Double(oldestRest)
+                : Double(rests.prefix(half).reduce(0, +)) / Double(half)
+            let previousEstimate = boundedEstimate(rest: olderMean, maxHR: maxHR)
+            let delta = currentEstimate - previousEstimate
+            if abs(delta) < 0.2 {
+                return ("Stable", "vs \(rests.count)-point RHR trend.", delta)
+            }
+            return (String(format: "%+.1f", delta), "vs \(rests.count)-point RHR trend.", delta)
+        }
+
+        private static func boundedEstimate(rest: Int, maxHR: Int) -> Double {
+            boundedEstimate(rest: Double(rest), maxHR: maxHR)
+        }
+
+        // Double-rest variant so an averaged RHR is not quantized to a whole bpm —
+        // 0.5 bpm moves the estimate by ~0.4, more than the "Stable" threshold.
+        private static func boundedEstimate(rest: Double, maxHR: Int) -> Double {
+            guard rest > 0 else { return 20 }
+            let rawEstimate = 15.3 * Double(maxHR) / rest
+            return min(max(rawEstimate, 20), 80)
+        }
+
+        private static func learning(detail: String,
+                                     narrative: String,
+                                     trendDetail: String) -> VO2MaxEstimateSummary {
+            VO2MaxEstimateSummary(value: nil,
+                                  confidence: "learning",
+                                  detail: detail,
+                                  narrative: narrative,
+                                  trendText: "Learning",
+                                  trendDetail: trendDetail,
+                                  trendDelta: nil)
+        }
+    }
+
+    enum BiologicalAge {
+        enum ReferenceSource: String, CaseIterable {
+            case vo2max = "VO2max: ACSM/Cooper VO2max percentile tables, sex-specific decade anchors"
+            case restingHeartRate = "Resting HR: adult resting heart-rate norms, lower-is-younger local anchors"
+            case hrv = "HRV: age-related RMSSD decline literature, morning/sleep RMSSD local anchors"
+            case sleep = "Sleep: adult sleep duration and efficiency guidance, plus consistency penalty"
+            case activity = "Activity: public step and cardio-load norms, monotonic local training-load proxy"
+            case bmi = "BMI: adult BMI category bands used only as a low-weight body-composition proxy"
+        }
+
+        static let referenceSourceFootnotes = ReferenceSource.allCases.map(\.rawValue)
+
+        // These reference curves are compact local approximations, not medical
+        // diagnosis or lifespan prediction. They intentionally avoid network calls
+        // and keep each source family visible for audit through ReferenceSource.
+        static func summary(chronologicalAge: Int,
+                            factors: [BioAgeFactor],
+                            trendDeltaYears: Int? = nil) -> BiologicalAgeSummary {
+            let biologicalAge = estimatedAge(chronologicalAge: chronologicalAge,
+                                             factors: factors)
+            let pace = agingPace(biologicalAge: biologicalAge,
+                                 chronologicalAge: chronologicalAge,
+                                 factors: factors,
+                                 trendDeltaYears: trendDeltaYears)
+            return BiologicalAgeSummary(biologicalAge: biologicalAge,
+                                        chronologicalAge: chronologicalAge,
+                                        ageDelta: biologicalAge - chronologicalAge,
+                                        agingPaceText: pace.text,
+                                        agingPaceDetail: pace.detail,
+                                        factors: factors,
+                                        blockers: [],
+                                        footnote: BiologicalAgeSummary.footnoteText)
+        }
+
+        static func estimatedAge(chronologicalAge: Int, factors: [BioAgeFactor]) -> Int {
+            let weighted = factors.reduce(0) { $0 + Double($1.ageEquivalent) * $1.weight }
+            let totalWeight = factors.reduce(0) { $0 + $1.weight }
+            let unclamped = Int((weighted / max(totalWeight, 0.01)).rounded())
+            return min(max(unclamped, chronologicalAge - 20), chronologicalAge + 20)
+        }
+
+        static func agingPace(biologicalAge: Int,
+                              chronologicalAge: Int,
+                              factors: [BioAgeFactor],
+                              trendDeltaYears: Int? = nil) -> (text: String, detail: String) {
+            if let trendDeltaYears {
+                if trendDeltaYears <= -1 {
+                    return ("Improving pace",
+                            "Body-age estimate is \(abs(trendDeltaYears))y younger vs the cached fitness trend.")
+                }
+                if trendDeltaYears >= 1 {
+                    return ("Widening pace",
+                            "Body-age estimate is \(trendDeltaYears)y older vs the cached fitness trend.")
+                }
+                return ("Stable pace",
+                        "Body-age estimate is steady vs the cached fitness trend.")
+            }
+            let delta = biologicalAge - chronologicalAge
+            let youngerWeight = factors
+                .filter { $0.direction == .younger }
+                .reduce(0) { $0 + $1.weight }
+            let olderWeight = factors
+                .filter { $0.direction == .older }
+                .reduce(0) { $0 + $1.weight }
+            let dominant = youngerWeight >= olderWeight ? "younger" : "older"
+            if delta <= -3 {
+                return ("Younger pace",
+                        "Current estimate is \(abs(delta))y younger; \(dominant) factors carry the most weight.")
+            }
+            if delta >= 3 {
+                return ("Older pace",
+                        "Current estimate is \(delta)y older; \(dominant) factors carry the most weight.")
+            }
+            return ("On pace",
+                    "Current estimate is close to chronological age; weekly trend unlocks after more local estimates.")
+        }
+
+        static func factor(id: String,
+                           label: String,
+                           ageEquivalent: Int,
+                           chronologicalAge: Int,
+                           weight: Double,
+                           detail: String) -> BioAgeFactor {
+            let delta = ageEquivalent - chronologicalAge
+            return BioAgeFactor(id: id,
+                                label: label,
+                                ageEquivalent: ageEquivalent,
+                                deltaVsChronological: delta,
+                                direction: delta == 0 ? .neutral : (delta < 0 ? .younger : .older),
+                                weight: weight,
+                                detail: detail)
+        }
+
+        static func vo2AgeEquivalent(_ vo2: Double, sex: AthleteProfile.BiologicalSex) -> Int {
+            let reference = sex == .female ? femaleVO2AgeReference : maleVO2AgeReference
+            return interpolatedAgeEquivalent(for: vo2,
+                                             reference: reference,
+                                             higherIsYounger: true)
+        }
+
+        // VO2max: adapted from ACSM/Cooper decade fitness norms. The app keeps
+        // only sex-specific decade anchors and interpolates locally.
+        private static let maleVO2AgeReference: [(age: Int, value: Double)] = [
+            (20, 52.0), (30, 48.5), (40, 45.0), (50, 41.5),
+            (60, 38.0), (70, 34.5), (80, 31.0), (90, 27.5)
+        ]
+
+        private static let femaleVO2AgeReference: [(age: Int, value: Double)] = [
+            (20, 44.0), (30, 41.0), (40, 38.0), (50, 35.0),
+            (60, 32.0), (70, 29.0), (80, 26.0), (90, 23.0)
+        ]
+
+        // Resting HR: adapted from adult resting-heart-rate norms where lower
+        // resting rate is a younger local anchor after baseline quality gates.
+        private static let restingHRAgeReference: [(age: Int, value: Double)] = [
+            (20, 58), (30, 60), (40, 62), (50, 64),
+            (60, 66), (70, 68), (80, 70), (90, 72)
+        ]
+
+        // HRV: adapted from age-related RMSSD decline literature, using a
+        // conservative morning/sleep RMSSD curve and no acute-health inference.
+        private static let rmssdAgeReference: [(age: Int, value: Double)] = [
+            (20, 70), (30, 58), (40, 46), (50, 36),
+            (60, 28), (70, 22), (80, 18), (90, 14)
+        ]
+
+        private static func interpolatedAgeEquivalent(for value: Double,
+                                                      reference: [(age: Int, value: Double)],
+                                                      higherIsYounger: Bool) -> Int {
+            guard let youngest = reference.first,
+                  let oldest = reference.last else { return 90 }
+            if higherIsYounger {
+                if value >= youngest.value { return 18 }
+                if value <= oldest.value { return 90 }
+            } else {
+                if value <= youngest.value { return 18 }
+                if value >= oldest.value { return 90 }
+            }
+
+            for index in 1..<reference.count {
+                let previous = reference[index - 1]
+                let next = reference[index]
+                let insideBand = higherIsYounger
+                    ? (value <= previous.value && value >= next.value)
+                    : (value >= previous.value && value <= next.value)
+                guard insideBand else { continue }
+                let numerator = higherIsYounger ? previous.value - value : value - previous.value
+                let denominator = abs(previous.value - next.value)
+                let fraction = numerator / max(denominator, 0.01)
+                let age = Double(previous.age) + fraction * Double(next.age - previous.age)
+                return min(max(Int(age.rounded()), 18), 90)
+            }
+            return 90
+        }
+
+        static func rhrAgeEquivalent(_ restingHR: Int) -> Int {
+            interpolatedAgeEquivalent(for: Double(restingHR),
+                                      reference: restingHRAgeReference,
+                                      higherIsYounger: false)
+        }
+
+        static func hrvAgeEquivalent(_ rmssd: Int) -> Int {
+            interpolatedAgeEquivalent(for: Double(rmssd),
+                                      reference: rmssdAgeReference,
+                                      higherIsYounger: true)
+        }
+
+        static func sleepAgeEquivalent(durationHours: Double,
+                                       efficiency: Double,
+                                       consistencyPercent: Int?,
+                                       chronologicalAge: Int) -> Int {
+            let durationPenalty = abs(durationHours - 7.5) * 2.0
+            let efficiencyPenalty = max(0, 0.85 - efficiency) * 35
+            let consistencyPenalty = consistencyPercent.map { max(0, 80 - Double($0)) / 8.0 } ?? 0
+            let bonus = durationPenalty < 1.0 && efficiency >= 0.88 && (consistencyPercent ?? 80) >= 85 ? -4.0 : 0
+            return min(max(Int((Double(chronologicalAge) + durationPenalty + efficiencyPenalty + consistencyPenalty + bonus).rounded()), 18), 90)
+        }
+
+        static func activityAgeEquivalent(_ chronicLoad: Double,
+                                          chronologicalAge: Int) -> Int {
+            let delta = min(max((chronicLoad - 25) / 3.0, -8), 8)
+            return min(max(Int((Double(chronologicalAge) - delta).rounded()), 18), 90)
+        }
+
+        static func bmiAgeEquivalent(_ bmi: Double,
+                                     chronologicalAge: Int) -> Int {
+            let penalty = bmi < 18.5 ? (18.5 - bmi) * 1.2 : max(0, bmi - 24.9) * 0.8
+            return min(max(Int((Double(chronologicalAge) + penalty).rounded()), 18), 90)
+        }
+    }
+
+    enum TrainingLoad {
+        static func summary(sessions: [SavedSession],
+                            rest: Int,
+                            maxHR: Int,
+                            calendar: Calendar = .current) -> TrainingLoadSummary {
+            guard maxHR > rest else { return .learning }
+            var trimpByDay: [Date: Double] = [:]
+            for session in sessions where session.points.count >= 2 {
+                for day in EventCivilTime.days(
+                    overlappedBy: session.start,
+                    end: session.end,
+                    eventTimeZoneIdentifier: session.eventTimeZoneIdentifier,
+                    outputCalendar: calendar
+                ) {
+                    guard let interval = EventCivilTime.interval(
+                        forCivilDay: day,
+                        eventTimeZoneIdentifier: session.eventTimeZoneIdentifier,
+                        outputCalendar: calendar
+                    ) else { continue }
+                    trimpByDay[day, default: 0] += session.dailyLoadTRIMP(
+                        rest: rest,
+                        max: maxHR,
+                        within: interval
+                    )
+                }
+            }
+            let dailyStrains = trimpByDay
+                .sorted { $0.key > $1.key }
+                .map { Strain.score(fromTRIMP: $0.value) }
+            return summary(dailyStrains: dailyStrains)
+        }
+
+        static func summary(dailyStrains: [Double]) -> TrainingLoadSummary {
+            guard !dailyStrains.isEmpty else { return .learning }
+
+            let acuteRollups = Array(dailyStrains.prefix(7))
+            let chronicRollups = Array(dailyStrains.prefix(28))
+            let acute = average(acuteRollups) ?? 0
+            let chronic = average(chronicRollups) ?? 0
+            let ratio = chronic > 0 ? acute / chronic : nil
+            let monotony = trainingMonotony(acuteRollups)
+            let enoughAcute = acuteRollups.count >= 3
+            let enoughChronic = chronicRollups.count >= 14
+            let confidence: String
+            if enoughChronic {
+                confidence = "local"
+            } else if enoughAcute {
+                confidence = "partial"
+            } else {
+                confidence = "learning"
+            }
+
+            let targetBand = targetBand(acute: acute, ratio: ratio, enoughAcute: enoughAcute)
+            let acwrSignal = acwrReadinessSignal(ratio: ratio, enoughChronic: enoughChronic)
+            let monotonySignal = monotonyReadinessSignal(monotony: monotony, enoughAcute: enoughAcute)
+            let readiness = trainingReadiness(acwrSignal: acwrSignal,
+                                             monotonySignal: monotonySignal,
+                                             ratio: ratio)
+            let detail = detail(confidence: confidence, readiness: readiness, ratio: ratio)
+
+            return TrainingLoadSummary(acuteLoad: acute,
+                                       chronicLoad: chronic,
+                                       ratio: ratio,
+                                       monotony: monotony,
+                                       confidence: confidence,
+                                       readiness: readiness,
+                                       acwrSignal: acwrSignal,
+                                       monotonySignal: monotonySignal,
+                                       targetBand: targetBand,
+                                       detail: detail)
+        }
+
+        static func trainingMonotony(_ dailyStrains: [Double]) -> Double? {
+            guard dailyStrains.count >= 3,
+                  let mean = average(dailyStrains),
+                  mean > 0 else { return nil }
+            let variance = dailyStrains.reduce(0) { total, value in
+                total + pow(value - mean, 2)
+            } / Double(dailyStrains.count)
+            let standardDeviation = sqrt(variance)
+            guard standardDeviation > 0.05 else { return 9.99 }
+            return min(mean / standardDeviation, 9.99)
+        }
+
+        static func acwrReadinessSignal(ratio: Double?, enoughChronic: Bool) -> String {
+            guard enoughChronic, let ratio else { return "learning" }
+            if ratio >= 1.50 || ratio < 0.60 { return "bad" }
+            if ratio > 1.30 || ratio < 0.80 { return "watch" }
+            return "good"
+        }
+
+        static func monotonyReadinessSignal(monotony: Double?, enoughAcute: Bool) -> String {
+            guard enoughAcute, let monotony else { return "learning" }
+            if monotony >= 2.50 { return "bad" }
+            if monotony >= 2.00 { return "watch" }
+            return "good"
+        }
+
+        static func trainingReadiness(acwrSignal: String,
+                                      monotonySignal: String,
+                                      ratio: Double?) -> String {
+            guard acwrSignal != "learning" || monotonySignal != "learning" else { return "learning" }
+            if acwrSignal == "bad" || monotonySignal == "bad" { return "rundown" }
+            if acwrSignal == "watch" || monotonySignal == "watch" { return "strained" }
+            if let ratio, ratio < 0.80 { return "primed" }
+            return "balanced"
+        }
+
+        private static func targetBand(acute: Double,
+                                       ratio: Double?,
+                                       enoughAcute: Bool) -> ClosedRange<Double>? {
+            guard enoughAcute else { return nil }
+            if let ratio {
+                if ratio > 1.30 {
+                    return max(0, acute - 4)...max(0, acute - 1)
+                }
+                if ratio < 0.80 {
+                    return acute...min(21, acute + 3)
+                }
+            }
+            return max(0, acute - 1.5)...min(21, acute + 1.5)
+        }
+
+        private static func detail(confidence: String,
+                                   readiness: String,
+                                   ratio: Double?) -> String {
+            if confidence == "learning" {
+                return TrainingLoadSummary.learning.detail
+            }
+            if readiness == "rundown" {
+                return "Rundown: training load is either spiking or too repetitive. Keep the next session easy."
+            }
+            if readiness == "strained" {
+                return "Strained: ACWR or monotony is elevated. Favor recovery or a lighter day."
+            }
+            if readiness == "primed" {
+                return "Primed: recent strain is below your base, with room to add load if recovery feels good."
+            }
+            if let ratio {
+                if ratio > 1.30 {
+                    return "Acute load is running ahead of your 28-day base."
+                }
+                if ratio < 0.80 {
+                    return "Recent strain is below your longer baseline."
+                }
+                return "Recent strain is aligned with your longer baseline."
+            }
+            return TrainingLoadSummary.learning.detail
+        }
+
+        private static func average(_ values: [Double]) -> Double? {
+            guard !values.isEmpty else { return nil }
+            return values.reduce(0, +) / Double(values.count)
+        }
+    }
+
+    enum CalibrationExamples {
+        struct Check: Equatable {
+            let name: String
+            let actual: Double
+            let expected: Double
+            let tolerance: Double
+
+            var passed: Bool {
+                abs(actual - expected) <= tolerance
+            }
+        }
+
+        struct LabelCheck: Equatable {
+            let name: String
+            let actual: String
+            let expected: String
+
+            var passed: Bool {
+                actual == expected
+            }
+        }
+
+        static let strainTRIMP = Check(name: "banister_strain_score",
+                                       actual: Strain.score(fromTRIMP: 50),
+                                       expected: 5.94,
+                                       tolerance: 0.05)
+
+        static let strainEdwards = Check(name: "edwards_strain_score",
+                                         actual: Strain.score(fromEdwardsLoad: 120),
+                                         expected: 17.69,
+                                         tolerance: 0.05)
+
+        static let recoveryHRV = Check(name: "hrv_recovery_score",
+                                       actual: Double(Recovery.estimate(hrvNow: 70,
+                                                                        hrvBaseline: 50,
+                                                                        restingNow: 58,
+                                                                        restingBaseline: 60)),
+                                       expected: 98,
+                                       tolerance: 1)
+
+        static let respiratoryRate = Check(name: "resp_rate_rsa",
+                                           actual: RespRateRsa.estimate(resampledRR: respiratorySineWave,
+                                                                        sampleRate: 4.0) ?? 0,
+                                           expected: 15.0,
+                                           tolerance: 0.5)
+
+        static let bodyAgeVO2 = Check(name: "bio_age_vo2_male",
+                                      actual: Double(BiologicalAge.vo2AgeEquivalent(48.5, sex: .male)),
+                                      expected: 30,
+                                      tolerance: 1)
+
+        static let bodyAgeSummary = Check(name: "bio_age_summary",
+                                          actual: Double(BiologicalAge.summary(chronologicalAge: 38,
+                                                                               factors: strongBodyAgeFactors).biologicalAge ?? 0),
+                                          expected: 23,
+                                          tolerance: 1)
+
+        static let recoveryTargetYellow = LabelCheck(name: "target_recovery_yellow",
+                                                     actual: TargetZones.recovery(55)?.level.rawValue ?? "nil",
+                                                     expected: "yellow")
+
+        static let hrvTargetGated = LabelCheck(name: "target_hrv_no_baseline",
+                                               actual: TargetZones.hrv(65,
+                                                                       baseline: 60,
+                                                                       baselineSamples: PersonalBaseline.trustedMinimumSamples - 1,
+                                                                       baselineTrusted: false)?.level.rawValue ?? "gated",
+                                               expected: "gated")
+
+        static let staleBaselineGated = LabelCheck(name: "fresh_baseline_old_samples_gated",
+                                                   actual: staleHeavyBaseline.hasTrustedHRVBaseline(now: calibrationNow) ? "trusted" : "gated",
+                                                   expected: "gated")
+
+        static let manualDayNap = LabelCheck(name: "manual_sleep_day_nap",
+                                             actual: ManualSleep.inferredIsNap(start: calibrationDate(hour: 13),
+                                                                               end: calibrationDate(hour: 13).addingTimeInterval(40 * 60),
+                                                                               currentSelection: false,
+                                                                               calendar: calibrationCalendar) ? "nap" : "sleep",
+                                             expected: "nap")
+
+        static let manualNightSleep = LabelCheck(name: "manual_sleep_night_sleep",
+                                                 actual: ManualSleep.inferredIsNap(start: calibrationDate(hour: 23),
+                                                                                   end: calibrationDate(hour: 23).addingTimeInterval(7 * 60 * 60),
+                                                                                   currentSelection: true,
+                                                                                   calendar: calibrationCalendar) ? "nap" : "sleep",
+                                                 expected: "sleep")
+
+        static let acwrWatch = LabelCheck(name: "acwr_watch",
+                                          actual: TrainingLoad.acwrReadinessSignal(ratio: 1.35,
+                                                                                   enoughChronic: true),
+                                          expected: "watch")
+
+        static let monotonyBad = LabelCheck(name: "monotony_bad",
+                                            actual: TrainingLoad.monotonyReadinessSignal(monotony: 2.7,
+                                                                                         enoughAcute: true),
+                                            expected: "bad")
+
+        static let readinessRundown = LabelCheck(name: "readiness_rundown",
+                                                 actual: TrainingLoad.trainingReadiness(acwrSignal: acwrWatch.actual,
+                                                                                        monotonySignal: monotonyBad.actual,
+                                                                                        ratio: 1.35),
+                                                 expected: "rundown")
+
+        // Sleep-window HRV: once >=7 fresh overnight HRV samples exist, the lnRMSSD
+        // baseline must be computed from overnight samples ONLY (count == overnight count),
+        // not blended with daytime samples.
+        static let hrvBaselinePrefersOvernight = LabelCheck(
+            name: "hrv_baseline_prefers_overnight",
+            actual: "\(overnightPreferredHRVBaseline.lnRMSSDStats(now: calibrationNow)?.count ?? -1)",
+            expected: "7")
+
+        // Safeguard: with too few overnight samples (<7), it must FALL BACK to all
+        // fresh samples so an intermittent overnight stream never starves the baseline.
+        static let hrvBaselineFallsBackBelowThreshold = LabelCheck(
+            name: "hrv_baseline_fallback_when_sparse_overnight",
+            actual: "\(sparseOvernightHRVBaseline.lnRMSSDStats(now: calibrationNow)?.count ?? -1)",
+            expected: "13")
+
+        static var numericChecks: [Check] {
+            [
+                strainTRIMP,
+                strainEdwards,
+                recoveryHRV,
+                respiratoryRate,
+                bodyAgeVO2,
+                bodyAgeSummary
+            ]
+        }
+
+        static var labelChecks: [LabelCheck] {
+            [
+                recoveryTargetYellow,
+                hrvTargetGated,
+                staleBaselineGated,
+                manualDayNap,
+                manualNightSleep,
+                acwrWatch,
+                monotonyBad,
+                readinessRundown,
+                hrvBaselinePrefersOvernight,
+                hrvBaselineFallsBackBelowThreshold
+            ]
+        }
+
+        static var allPassed: Bool {
+            numericChecks.allSatisfy(\.passed) && labelChecks.allSatisfy(\.passed)
+        }
+
+        private static let respiratorySineWave: [Double] = (0..<240).map { index in
+            900 + 50 * sin(2 * .pi * (15.0 / 60.0) * Double(index) / 4.0)
+        }
+
+        private static let calibrationCalendar: Calendar = {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
+            return calendar
+        }()
+
+        private static func calibrationDate(hour: Int) -> Date {
+            calibrationCalendar.date(from: DateComponents(year: 2026,
+                                                          month: 6,
+                                                          day: 27,
+                                                          hour: hour)) ?? Date(timeIntervalSinceReferenceDate: 0)
+        }
+
+        private static let calibrationNow = calibrationDate(hour: 12)
+
+        private static let staleHeavyBaseline = PersonalBaseline(restingHR: 60,
+                                                                 hrvEMA: 55,
+                                                                 sessions: 14,
+                                                                 updated: calibrationNow,
+                                                                 samples: staleBaselineSamples)
+
+        // 7 fresh overnight HRV samples + 6 fresh daytime: overnight preference (>=7)
+        // should make lnRMSSDStats use the 7 overnight samples only.
+        private static let overnightPreferredHRVBaseline: PersonalBaseline = {
+            var samples: [PersonalBaseline.BaselineSample] = []
+            for index in 0..<7 {
+                samples.append(PersonalBaseline.BaselineSample(date: calibrationNow.addingTimeInterval(-Double(index) * 24 * 3_600),
+                                                              restingHR: 55, rmssd: 62, overnight: true))
+            }
+            for index in 0..<6 {
+                samples.append(PersonalBaseline.BaselineSample(date: calibrationNow.addingTimeInterval(-Double(index + 7) * 24 * 3_600),
+                                                              restingHR: 58, rmssd: 30, overnight: false))
+            }
+            return PersonalBaseline(restingHR: 56, hrvEMA: 55, sessions: samples.count, updated: calibrationNow, samples: samples)
+        }()
+
+        // 3 overnight + 10 daytime (13 total): below the 7-overnight threshold, so it
+        // must fall back to all 13 fresh HRV samples (no starvation).
+        private static let sparseOvernightHRVBaseline: PersonalBaseline = {
+            var samples: [PersonalBaseline.BaselineSample] = []
+            for index in 0..<3 {
+                samples.append(PersonalBaseline.BaselineSample(date: calibrationNow.addingTimeInterval(-Double(index) * 24 * 3_600),
+                                                              restingHR: 55, rmssd: 62, overnight: true))
+            }
+            for index in 0..<10 {
+                samples.append(PersonalBaseline.BaselineSample(date: calibrationNow.addingTimeInterval(-Double(index + 3) * 24 * 3_600),
+                                                              restingHR: 58, rmssd: 40, overnight: false))
+            }
+            return PersonalBaseline(restingHR: 57, hrvEMA: 50, sessions: samples.count, updated: calibrationNow, samples: samples)
+        }()
+
+        private static let staleBaselineSamples: [PersonalBaseline.BaselineSample] = {
+            let oldDate = calibrationNow.addingTimeInterval(-(PersonalBaseline.staleAfter + 24 * 60 * 60))
+            var samples = (0..<13).map { index in
+                PersonalBaseline.BaselineSample(date: oldDate.addingTimeInterval(Double(index)),
+                                                restingHR: 60,
+                                                rmssd: 55)
+            }
+            samples.append(PersonalBaseline.BaselineSample(date: calibrationNow,
+                                                           restingHR: 59,
+                                                           rmssd: 56))
+            return samples
+        }()
+
+        private static let strongBodyAgeFactors: [BioAgeFactor] = [
+            BiologicalAge.factor(id: "vo2",
+                                  label: "VO2max",
+                                  ageEquivalent: BiologicalAge.vo2AgeEquivalent(55, sex: .male),
+                                  chronologicalAge: 38,
+                                  weight: 0.30,
+                                  detail: "VO2max 55"),
+            BiologicalAge.factor(id: "rhr",
+                                  label: "RHR",
+                                  ageEquivalent: BiologicalAge.rhrAgeEquivalent(55),
+                                  chronologicalAge: 38,
+                                  weight: 0.20,
+                                  detail: "RHR 55"),
+            BiologicalAge.factor(id: "hrv",
+                                  label: "HRV",
+                                  ageEquivalent: BiologicalAge.hrvAgeEquivalent(70),
+                                  chronologicalAge: 38,
+                                  weight: 0.20,
+                                  detail: "HRV 70"),
+            BiologicalAge.factor(id: "sleep",
+                                  label: "Sleep",
+                                  ageEquivalent: BiologicalAge.sleepAgeEquivalent(durationHours: 7.5,
+                                                                                  efficiency: 0.90,
+                                                                                  consistencyPercent: 92,
+                                                                                  chronologicalAge: 38),
+                                  chronologicalAge: 38,
+                                  weight: 0.15,
+                                  detail: "7.5h, 90%, consistent"),
+            BiologicalAge.factor(id: "activity",
+                                  label: "Activity",
+                                  ageEquivalent: BiologicalAge.activityAgeEquivalent(36,
+                                                                                    chronologicalAge: 38),
+                                  chronologicalAge: 38,
+                                  weight: 0.10,
+                                  detail: "load 36"),
+            BiologicalAge.factor(id: "bmi",
+                                  label: "BMI",
+                                  ageEquivalent: BiologicalAge.bmiAgeEquivalent(22,
+                                                                                chronologicalAge: 38),
+                                  chronologicalAge: 38,
+                                  weight: 0.05,
+                                  detail: "BMI 22")
+        ]
+    }
+}

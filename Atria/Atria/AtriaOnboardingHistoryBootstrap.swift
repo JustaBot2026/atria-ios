@@ -1,0 +1,437 @@
+import Combine
+import Foundation
+
+enum AtriaOnboardingHistoryBootstrapPolicy {
+    /// The setup contract is deliberately narrower than "erase the strap".
+    /// We have verified how to read and acknowledge a durable replay page, but
+    /// not a command that physically erases WHOOP flash.  Treating a cursor
+    /// acknowledgement as an erase would make a destructive claim we cannot
+    /// prove (and could lose a user's only copy of a night).
+    enum FreshStartPolicy {
+        static let title = "Start a new Atria timeline"
+        static let summary = "Live heart rate first. Older records import later, without interrupting it."
+        static let disclosure = "Live collection starts once the strap signal is verified. Existing records stay on the strap until import will not interrupt heart rate. Verified replay pages are acknowledged only after they are saved on this iPhone. Atria does not send a physical-erase command."
+        static let interruptionDisclosure = "If import stops, Atria resumes it later. It never disconnects live tracking or discards unseen strap data to force a fresh start."
+        static let liveReadyDetail = "Ready · live tracking stays on while existing history waits for a safe idle window"
+
+        static func completionDetail(importedRows: Int) -> String {
+            importedRows > 0
+                ? "Existing strap records were saved. Your new Atria timeline has started."
+                : "Strap history was verified. Your new Atria timeline has started."
+        }
+    }
+
+    nonisolated static func canComplete(durableTransportAuthorityAndLiveRestored: Bool,
+                                        recoveredDataPublished: Bool,
+                                        requestedPeripheralIdentifier: String,
+                                        currentPeripheralIdentifier: String?) -> Bool {
+        durableTransportAuthorityAndLiveRestored
+            && recoveredDataPublished
+            && currentPeripheralIdentifier == requestedPeripheralIdentifier
+    }
+}
+
+/// Crash-resumable owner for the first-run strap import.
+///
+/// The BLE history reducer remains the sole owner of transport, fsync and ACK
+/// ordering. This coordinator only sequences its public completion fence with
+/// SessionStore's recovered-data publication fence, and persists enough state
+/// for onboarding to resume honestly after process death.
+@MainActor
+final class AtriaOnboardingHistoryBootstrap: ObservableObject {
+    enum Phase: String, Codable, Equatable {
+        case waitingForStrap
+        case importing
+        case publishing
+        case complete
+        case failed
+    }
+
+    struct Snapshot: Codable, Equatable {
+        static let schema = 1
+
+        var schema: Int = Self.schema
+        var phase: Phase
+        var peripheralIdentifier: String?
+        var importedRows: Int
+        var attempt: Int
+        var updatedAt: Date
+        var detail: String
+
+        static func initial(now: Date = Date()) -> Snapshot {
+            Snapshot(phase: .waitingForStrap,
+                     peripheralIdentifier: nil,
+                     importedRows: 0,
+                     attempt: 0,
+                     updatedAt: now,
+                     detail: "Waiting for your strap")
+        }
+    }
+
+    @Published private(set) var snapshot: Snapshot
+
+    private let ble: AtriaBLEManager
+    private let store: SessionStore
+    private let persistenceURL: URL?
+    private var bootstrapTask: Task<Void, Never>?
+    private var pairingPreflightCancellable: AnyCancellable? = nil
+
+    init(ble: AtriaBLEManager,
+         store: SessionStore,
+         persistenceURL: URL? = AtriaOnboardingHistoryBootstrap.defaultPersistenceURL) {
+        self.ble = ble
+        self.store = store
+        self.persistenceURL = persistenceURL
+        self.snapshot = Self.load(from: persistenceURL) ?? .initial()
+        self.pairingPreflightCancellable = ble.$onboardingPairingPreflightInFlight
+            .removeDuplicates()
+            .dropFirst()
+            .filter { !$0 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.startOrResumeIfPossible()
+            }
+    }
+
+    deinit {
+        bootstrapTask?.cancel()
+    }
+
+    var isCompleteForCurrentStrap: Bool {
+        guard snapshot.phase == .complete,
+              let current = ble.currentPeripheralIdentifier else { return false }
+        return snapshot.peripheralIdentifier == current
+    }
+
+    var isWorking: Bool {
+        snapshot.phase == .importing || snapshot.phase == .publishing
+    }
+
+    /// Called from the narrow onboarding connection observer. Repeated calls
+    /// are harmless; one retained task owns the complete import transaction.
+    func startOrResumeIfPossible() {
+        guard bootstrapTask == nil else { return }
+        guard snapshot.phase != .failed else { return }
+        guard let peripheralIdentifier = ble.currentPeripheralIdentifier else {
+            if snapshot.phase != .complete && snapshot.phase != .failed {
+                transition(to: .waitingForStrap,
+                           peripheralIdentifier: snapshot.peripheralIdentifier,
+                           detail: "Waiting for your strap")
+            }
+            return
+        }
+        if snapshot.phase == .complete,
+           snapshot.peripheralIdentifier == peripheralIdentifier {
+            return
+        }
+        // Standard 2A37 HR does not prove access to WHOOP's protected command
+        // channel. Give the exact read-only 22/00 preflight its one
+        // connection-scoped opportunity before the history owner starts,
+        // except during a quiet diagnostic lease which blocks proprietary TX.
+        if !AtriaIMUDiagnosticTransport.isQuietLeaseActive() {
+            ble.requestOnboardingPairingPreflightIfNeeded()
+            if ble.onboardingPairingPreflightInFlight {
+                if snapshot.phase != .complete && snapshot.phase != .failed {
+                    transition(
+                        to: .waitingForStrap,
+                        peripheralIdentifier: peripheralIdentifier,
+                        detail: "Confirming strap access"
+                    )
+                }
+                return
+            }
+        }
+        guard ble.onboardingLiveHeartRateThisConnection else {
+            if snapshot.phase != .complete && snapshot.phase != .failed {
+                transition(
+                    to: .waitingForStrap,
+                    peripheralIdentifier: peripheralIdentifier,
+                    detail: "Waiting for your strap"
+                )
+            }
+            return
+        }
+        if snapshot.peripheralIdentifier != nil,
+           snapshot.peripheralIdentifier != peripheralIdentifier {
+            snapshot = .initial()
+            persist()
+        }
+        // Completion needs the protected channel proven (2026-09-24 setup
+        // rework): a declined or failed secure check must surface as a coded
+        // setup problem on the strap page, never as a silent "Ready".
+        if ble.status == .connected,
+           !AtriaIMUDiagnosticTransport.isQuietLeaseActive(),
+           !AtriaStrapSetup.Tracker.verifies(ble.strapSetupSignals.secureCheck) {
+            if snapshot.phase != .complete && snapshot.phase != .failed {
+                transition(
+                    to: .waitingForStrap,
+                    peripheralIdentifier: peripheralIdentifier,
+                    detail: "Confirming strap access"
+                )
+            }
+            return
+        }
+
+        let nextAttempt = snapshot.attempt + 1
+        // First use is complete once this exact strap has passed the read-only
+        // secure preflight and delivered fresh HR. Historical replay shares the
+        // proprietary command pipe with realtime motion; a physical Build 5
+        // soak proved that making it an onboarding prerequisite disconnected
+        // the just-established link. Queue the import, preserve its intent, and
+        // let a natural transport boundary service it without blocking setup.
+        if ble.status == .connected {
+            _ = ble.requestOfflineHistoricalSyncIfNeeded(
+                reason: "onboarding_initial_import",
+                force: false
+            )
+            guard transition(
+                to: .complete,
+                peripheralIdentifier: peripheralIdentifier,
+                importedRows: 0,
+                attempt: nextAttempt,
+                detail: AtriaOnboardingHistoryBootstrapPolicy
+                    .FreshStartPolicy.liveReadyDetail
+            ) else {
+                snapshot.phase = .failed
+                snapshot.detail = "Atria connected to your strap but could not save setup progress. Free storage space, then retry; live tracking remains unaffected."
+                return
+            }
+            AtriaDebugLog(
+                "ATRIADBG onboarding_history status=live_ready_history_deferred peripheral=%@ attempt=%d action=complete_setup_preserve_realtime_queue_import",
+                peripheralIdentifier,
+                nextAttempt
+            )
+            return
+        }
+        guard transition(to: .importing,
+                         peripheralIdentifier: peripheralIdentifier,
+                         importedRows: 0,
+                         attempt: nextAttempt,
+                         detail: nextAttempt == 1
+                            ? "Securely importing existing strap history"
+                            : "Resuming the secure strap import") else {
+            snapshot.phase = .failed
+            snapshot.detail = "Atria could not save setup progress. Free storage space, then retry; no strap history was changed."
+            return
+        }
+
+        bootstrapTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let rowsBefore = await Task.detached(priority: .utility) {
+                HistoricalArchive.diagnostics().rows
+            }.value
+
+            // This public BLE fence returns true only after every exact retirement
+            // ACK has followed its raw+identity fsync and either the genuine
+            // HISTORY_COMPLETE terminal has durable authority or a matched 22/00
+            // cursor proves the strap is empty. Both paths require fresh live HR;
+            // generations with typed receipt work also wait for all five receipts.
+            let durableTransportAuthorityAndLiveRestored = await self.ble
+                .requestOfflineHistoricalSyncAwaitingCompletion(
+                    reason: "onboarding_initial_import",
+                    force: true
+                )
+            guard !Task.isCancelled else {
+                self.bootstrapTask = nil
+                return
+            }
+            guard durableTransportAuthorityAndLiveRestored else {
+                self.fail(
+                    peripheralIdentifier: peripheralIdentifier,
+                    detail: "The strap import did not finish. Keep the strap nearby, put it in pairing mode, accept Pair if iPhone asks, then retry. Your saved data was not discarded."
+                )
+                return
+            }
+
+            guard self.transition(
+                to: .publishing,
+                peripheralIdentifier: peripheralIdentifier,
+                importedRows: max(0, HistoricalArchive.diagnostics().rows - rowsBefore),
+                detail: "History complete. Preparing sleep, activity, steps, and your baseline"
+            ) else {
+                self.fail(
+                    peripheralIdentifier: peripheralIdentifier,
+                    detail: "Your strap history is safely stored, but Atria could not save setup progress. Free storage space, then retry."
+                )
+                return
+            }
+            let publicationComplete = await self.store
+                .requestAndAwaitRecoveredDataPublication(
+                    reason: "onboarding_initial_import",
+                    timeout: .seconds(180)
+                )
+            guard !Task.isCancelled else {
+                self.bootstrapTask = nil
+                return
+            }
+            guard AtriaOnboardingHistoryBootstrapPolicy.canComplete(
+                durableTransportAuthorityAndLiveRestored:
+                    durableTransportAuthorityAndLiveRestored,
+                recoveredDataPublished: publicationComplete,
+                requestedPeripheralIdentifier: peripheralIdentifier,
+                currentPeripheralIdentifier: self.ble.currentPeripheralIdentifier
+            ) else {
+                self.fail(
+                    peripheralIdentifier: peripheralIdentifier,
+                    detail: publicationComplete
+                        ? "The strap changed before setup finished. Reconnect the strap you want to use and retry."
+                        : "Your strap history is safely stored, but Atria could not finish preparing it. Retry to resume; the strap data will not be imported twice."
+                )
+                return
+            }
+
+            let rowsAfter = await Task.detached(priority: .utility) {
+                HistoricalArchive.diagnostics().rows
+            }.value
+            guard self.transition(
+                to: .complete,
+                peripheralIdentifier: peripheralIdentifier,
+                importedRows: max(0, rowsAfter - rowsBefore),
+                detail: AtriaOnboardingHistoryBootstrapPolicy.FreshStartPolicy.completionDetail(
+                    importedRows: max(0, rowsAfter - rowsBefore)
+                )
+            ) else {
+                self.snapshot.phase = .failed
+                self.snapshot.detail = "Setup finished safely, but its completion record could not be saved. Free storage space, then retry."
+                self.bootstrapTask = nil
+                return
+            }
+            self.bootstrapTask = nil
+            AtriaDebugLog("ATRIADBG onboarding_history status=complete peripheral=%@ imported_rows=%d attempt=%d",
+                          peripheralIdentifier,
+                          self.snapshot.importedRows,
+                          self.snapshot.attempt)
+        }
+    }
+
+    /// Setup finished for the strap this phone is bonded to. Unlike
+    /// `isCompleteForCurrentStrap` it survives link blips and range loss: the
+    /// old current-peripheral-only check bounced a finished user back into
+    /// setup whenever the strap dropped between pages (2026-09-24 rework).
+    var isSetupComplete: Bool {
+        guard snapshot.phase == .complete,
+              let done = snapshot.peripheralIdentifier else { return false }
+        return done == (ble.currentPeripheralIdentifier ?? ble.savedPeripheralIdentifier)
+    }
+
+    /// The setup screen proved this exact strap's protected channel (the
+    /// read-only secure check confirmed on a live link). Record completion for
+    /// it directly and queue the history import; the import is never a
+    /// prerequisite (a physical Build 5 soak proved that making it one
+    /// disconnected the just-established link).
+    @discardableResult
+    func completeVerifiedSetup(peripheralIdentifier: String) -> Bool {
+        if snapshot.phase == .complete, snapshot.peripheralIdentifier == peripheralIdentifier {
+            return true
+        }
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
+        if ble.status == .connected {
+            _ = ble.requestOfflineHistoricalSyncIfNeeded(
+                reason: "onboarding_initial_import",
+                force: false
+            )
+        }
+        guard transition(
+            to: .complete,
+            peripheralIdentifier: peripheralIdentifier,
+            importedRows: 0,
+            attempt: snapshot.attempt + 1,
+            detail: AtriaOnboardingHistoryBootstrapPolicy.FreshStartPolicy.liveReadyDetail
+        ) else {
+            snapshot.phase = .failed
+            snapshot.detail = "Your strap is connected, but Atria couldn't save setup. Free up iPhone storage, then tap Continue."
+            return false
+        }
+        AtriaDebugLog("ATRIADBG onboarding_history status=verified_setup_complete peripheral=%@",
+                      peripheralIdentifier)
+        return true
+    }
+
+    func retry() {
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
+        transition(to: .waitingForStrap,
+                   peripheralIdentifier: snapshot.peripheralIdentifier,
+                   importedRows: snapshot.importedRows,
+                   detail: "Waiting for your strap")
+        if ble.status != .connected {
+            ble.startScan(reason: "onboarding_primary_connect")
+        }
+        startOrResumeIfPossible()
+    }
+
+    private func fail(peripheralIdentifier: String, detail: String) {
+        transition(to: .failed,
+                   peripheralIdentifier: peripheralIdentifier,
+                   importedRows: snapshot.importedRows,
+                   detail: detail)
+        bootstrapTask = nil
+        AtriaDebugLog("ATRIADBG onboarding_history status=failed peripheral=%@ attempt=%d detail=%@",
+                      peripheralIdentifier,
+                      snapshot.attempt,
+                      detail)
+    }
+
+    @discardableResult
+    private func transition(to phase: Phase,
+                            peripheralIdentifier: String?,
+                            importedRows: Int? = nil,
+                            attempt: Int? = nil,
+                            detail: String) -> Bool {
+        snapshot.phase = phase
+        snapshot.peripheralIdentifier = peripheralIdentifier
+        if let importedRows { snapshot.importedRows = max(0, importedRows) }
+        if let attempt { snapshot.attempt = max(0, attempt) }
+        snapshot.updatedAt = Date()
+        snapshot.detail = detail
+        return persist()
+    }
+
+    @discardableResult
+    private func persist() -> Bool {
+        guard let persistenceURL else { return true }
+        do {
+            try FileManager.default.createDirectory(
+                at: persistenceURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .millisecondsSince1970
+            encoder.outputFormatting = [.sortedKeys]
+            let encoded = try encoder.encode(snapshot)
+            try encoded.write(
+                to: persistenceURL,
+                options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+            )
+            let handle = try FileHandle(forWritingTo: persistenceURL)
+            defer { try? handle.close() }
+            try handle.synchronize()
+            return true
+        } catch {
+            AtriaDebugLog("ATRIADBG onboarding_history status=persist_failed phase=%@ error=%@",
+                          snapshot.phase.rawValue,
+                          String(describing: error))
+            return false
+        }
+    }
+
+    nonisolated static var defaultPersistenceURL: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory,
+                                 in: .userDomainMask).first?
+            .appendingPathComponent("Onboarding", isDirectory: true)
+            .appendingPathComponent("strap-history-bootstrap-v1.json")
+    }
+
+    nonisolated static func load(from url: URL?) -> Snapshot? {
+        guard let url,
+              let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        guard let decoded = try? decoder.decode(Snapshot.self, from: data),
+              decoded.schema == Snapshot.schema,
+              decoded.importedRows >= 0,
+              decoded.attempt >= 0 else { return nil }
+        return decoded
+    }
+}

@@ -1,0 +1,1190 @@
+import Foundation
+
+/// Typed, pure motion-availability authority. Distinguishes a terminal pure-HR
+/// fallback (motion genuinely unavailable in the current transport) from
+/// protected-R10 modes that still carry, or can still qualify, motion — so no
+/// surface labels motion "unavailable" merely because the HR-minimal radio flag
+/// is set. Resolved from a plain input snapshot so it is unit-testable with no
+/// BLE state. `unavailableInCurrentTransport` requires the exact terminal
+/// conjunction; anything short of that fails closed to `stale`/`unknown`.
+/// Product surfaces must keep compact `0x33` and leftover native R10 separate.
+/// Compact recovery (live `0x33`, then continuity and equal-quality `0x34`)
+/// is the required route. Native `2B/0A` R10 is an alternative under evaluation:
+/// it may describe only intervals that actually arrived, never a compact pass,
+/// and never a 1 Hz historical bank stretched to 100 Hz.
+enum AtriaStrapMotionProductRoute: Equatable, Sendable {
+    case compactLive
+    case nativeR10Observed
+    case historicalGravity1Hz
+    case unspecified
+
+    static func resolve(validationState: String) -> Self {
+        switch validationState {
+        case "r10_live_validated",
+             "r10_live_preliminary",
+             "r10_live_calibrating",
+             "passive_r10_unavailable":
+            return .nativeR10Observed
+        case "whoop4_historical_gravity_1hz",
+             AtriaHistoricalStepRecovery.Provenance.whoop4HistoricalGravity1Hz.rawValue:
+            return .historicalGravity1Hz
+        case "compact_33_live", "validated":
+            return .compactLive
+        default:
+            return .unspecified
+        }
+    }
+
+    var liveDetailText: String {
+        switch self {
+        case .compactLive:
+            return "Today so far · live"
+        case .nativeR10Observed:
+            return "Today so far · native stream"
+        case .historicalGravity1Hz:
+            return "1 Hz history · not 100 Hz gait"
+        case .unspecified:
+            return "Today so far · live"
+        }
+    }
+
+    var liveEstimateDetailText: String {
+        switch self {
+        case .historicalGravity1Hz:
+            return "1 Hz history · not 100 Hz gait"
+        case .nativeR10Observed:
+            return "Today so far · estimate"
+        case .compactLive, .unspecified:
+            return "Today so far · estimate"
+        }
+    }
+}
+
+enum AtriaStrapMotionAvailability: Equatable, Sendable {
+    /// Fresh validated R10/IMU/live-motion evidence exists.
+    case live
+    /// A legitimate motion-bank/compact offload is active or pending.
+    case catchingUp
+    /// Protected owner is launch-pending/proving; qualification not yet failed.
+    case qualifying
+    /// Prior verified motion exists but is no longer current; no proof yet that
+    /// the transport is terminally motionless.
+    case stale
+    /// Exact evidence proves a pure-HR fallback cannot deliver motion now.
+    case unavailableInCurrentTransport
+    /// Evidence insufficient — fail closed rather than invent a motion blocker.
+    case unknown
+
+    /// Motion is "fresh" within this window (seconds). Aligns with the
+    /// protected-R10 missing-frame timeout that already governs the transport.
+    static let motionFreshnessWindow: TimeInterval = 20
+
+    struct Input: Equatable, Sendable {
+        var cleanOwner: AtriaBLEManager.ProtectedR10CleanOwner
+        var cleanOwnerState: AtriaBLEManager.ProtectedR10CleanOwnerState
+        var streamSuppressed: Bool
+        /// Age (s) of the freshest validated R10/IMU/live-motion frame; nil = none.
+        var freshMotionAge: TimeInterval?
+        /// A legitimate app-owned motion-bank offload is active or pending.
+        var hasActiveMotionBankOffload: Bool
+        /// Any prior verified motion/step evidence exists (coverage or steps > 0).
+        var hasPriorVerifiedMotion: Bool
+        var freshnessWindow: TimeInterval = AtriaStrapMotionAvailability.motionFreshnessWindow
+    }
+
+    static func resolve(_ input: Input) -> AtriaStrapMotionAvailability {
+        // 1. Fresh validated motion wins regardless of an older fallback marker.
+        if let age = input.freshMotionAge, age >= 0, age <= input.freshnessWindow {
+            return .live
+        }
+        // 2. A legitimate motion-bank offload catching up is not "unavailable".
+        if input.hasActiveMotionBankOffload {
+            return .catchingUp
+        }
+        // 3. Protected owner still launch-pending/proving: bounded qualification
+        //    has not terminally failed, so motion may still arrive.
+        switch input.cleanOwnerState {
+        case .protectedLaunchPending, .proving:
+            return .qualifying
+        default:
+            break
+        }
+        // 4. Terminal pure-HR fallback — the ONLY unavailable state: a pure-HR
+        //    owner in a terminal fallback state with the R10 stream suppressed,
+        //    no fresh motion, no active qualification, and no catching-up offload
+        //    (2 and 3 above already excluded those). protectedV9 + qualified can
+        //    never reach here.
+        let isPureHROwner = input.cleanOwner == .pureHRV8 || input.cleanOwner == .pureHRV10
+        let isTerminalFallback = input.cleanOwnerState == .fallbackActive
+            || input.cleanOwnerState == .fallbackPending
+        if isPureHROwner, isTerminalFallback, input.streamSuppressed {
+            return .unavailableInCurrentTransport
+        }
+        // 5. Prior verified motion but no proof the transport is terminally
+        //    motionless: stale, not terminal.
+        if input.hasPriorVerifiedMotion {
+            return .stale
+        }
+        // 6. Insufficient evidence: fail closed.
+        return .unknown
+    }
+}
+
+/// One honest value for step surfaces. A verified closed archive day is exact;
+/// a live count or a gapped archive subtotal is explicitly partial.
+struct AtriaDailyStepPresentation: Equatable, Sendable {
+    /// R10 emits one detector-applied coordinate per device second.  A saved
+    /// subtotal must never remain the open day's "live" source once that
+    /// stream has stopped: it may be an honest historical estimate, but using
+    /// it to outrank a fresh phone total makes an old undercount look current.
+    /// Keep this aligned with the strap-steps freshness tile.
+    static let liveEvidenceMaximumAge: TimeInterval = 15
+
+    /// Keep the sensor observation time. Publication, widget refresh, HR, and
+    /// reconnect must not mint a fresh capture clock. A prior-cycle stamp stays
+    /// prior-cycle so resolve can show unavailable/held instead of fake liveness.
+    static func inCycleCaptureClock(
+        liveCapturedAt: Date?,
+        cycleStart: Date,
+        now: Date,
+        presentedCount: Int
+    ) -> Date? {
+        _ = (cycleStart, now, presentedCount)
+        return liveCapturedAt
+    }
+
+    /// An in-cycle live step estimate may raise the shown total above the
+    /// drained verified floor only while verified coverage is below this
+    /// fraction — i.e. enough of the day is still undrained that the live
+    /// estimate legitimately fills the gap. Once verified coverage is high the
+    /// drained count is the trustworthy total and an inflated/preliminary live
+    /// count (e.g. 9999 steps over 75% coverage of one hour) must not override
+    /// it. This is the reliability guard on the 2026-08-22 live-estimate change.
+    static let liveEstimateCoverageCeiling: Double = 0.6
+
+    /// Physiological cadence ceiling for a standalone live estimate shown with NO
+    /// drained floor to sanity-check against. Sustained human step cadence tops
+    /// out near 3–3.5 steps/s (elite running). Counts above this for the open
+    /// cycle are withheld — never shown as today's total and never replaced
+    /// with the ceiling as if it were an observed walk.
+    static let liveEstimateMaxStepsPerSecond: Double = 3.5
+
+    static func plausibleOpenCycleStepCount(
+        count: Int,
+        windowStart: Date,
+        capturedAt: Date?
+    ) -> Int? {
+        let steps = max(0, count)
+        guard steps > 0 else { return 0 }
+        let clock = capturedAt ?? windowStart
+        let elapsed = max(0, clock.timeIntervalSince(windowStart))
+        let ceiling = Int((elapsed * liveEstimateMaxStepsPerSecond).rounded())
+        guard steps <= ceiling else { return nil }
+        return steps
+    }
+
+    enum Completeness: Equatable, Sendable {
+        case complete
+        case partial
+        case unavailable
+    }
+
+    enum Source: Equatable, Sendable {
+        case live
+        case verifiedCanonical
+        case none
+    }
+
+    enum UnavailabilityReason: Equatable, Sendable {
+        case none
+        case noCurrentCycleReceipt
+        /// 2026-07-31: the open cycle has no receipt or fresh live sample yet,
+        /// but the preceding cycle closed with a verified receipt. The count
+        /// stays nil — prior-cycle steps are disclosed in copy only and are
+        /// never attributed to today.
+        case priorCycleReceiptOnly
+        case staleLiveReceipt
+        case unvalidatedLiveReceipt
+        case motionObservedCountUnresolved
+        case conflictingExactReceipts
+        case stepModelNotQualified
+        /// Last in-cycle count is still the honest floor while IMU/R10 recovers.
+        /// The number stays visible; copy must not claim it is live.
+        case heldWhileMotionSyncing
+    }
+
+    /// Disclosure-only summary of the newest receipt that ended at or before
+    /// the current wake boundary. Carried alongside a nil `count` so rings,
+    /// zones, and widget step values remain honestly empty.
+    struct PriorCycleReceipt: Equatable, Sendable {
+        let steps: Int
+        let endedAt: Date
+    }
+
+    let day: Date
+    let count: Int?
+    let completeness: Completeness
+    let source: Source
+    let isValidated: Bool
+    let capturedAt: Date?
+    let coverageFraction: Double?
+    var unavailabilityReason: UnavailabilityReason = .none
+    /// Coverage can be complete through the current projection boundary while
+    /// the physiological day itself is still open. Keep those two facts
+    /// separate so an exact "today so far" count is never described as a
+    /// completed day.
+    var isOpenCycle: Bool = false
+    /// A durable exact subtotal remains exact after its collection clock ages,
+    /// but it no longer describes the current edge of an open physiological
+    /// cycle. Keep the count and make that time boundary explicit in copy.
+    var openCycleReceiptIsCurrent: Bool = false
+    /// Set only with `unavailabilityReason == .priorCycleReceiptOnly`.
+    var priorCycleReceipt: PriorCycleReceipt? = nil
+    /// True when a prior-cycle receipt was carried forward as THIS open
+    /// cycle's count because the wake boundary is an unconfirmed no-sleep
+    /// fallback (a synthetic civil-day guess), not a confirmed main sleep.
+    /// The steps were recorded in the same continuous, unbroken wear period,
+    /// so a fabricated day boundary must not strand them in "Yesterday" while
+    /// the hero shows "--". Self-corrects once this cycle drains its own
+    /// coverage or a real sleep is confirmed. Never set for a `.mainSleep`
+    /// boundary, where the day boundary is real and the strict split holds.
+    var carriedFromUnconfirmedPriorCycle: Bool = false
+    /// Typed strap-motion authority for the forward-looking step copy. `nil`
+    /// (default) preserves the existing progress wording for every caller that
+    /// does not classify motion; the call site sets it from the BLE snapshot.
+    var motionAvailability: AtriaStrapMotionAvailability? = nil
+    /// Compact vs leftover native R10 vs 1 Hz history. Default unspecified
+    /// keeps older callers on compact-shaped "live" wording only when the
+    /// count is independently validated.
+    var productRoute: AtriaStrapMotionProductRoute = .unspecified
+    /// Why live motion is deliberately off right now (power policy: strap or
+    /// phone battery, Low Power Mode, heat). While paused, steps can only come
+    /// from the strap's history bank, so the count is partial and grows as
+    /// history syncs: it is never a zero and never a finished day
+    /// (2026-09-24: live R10 is off below the strap-battery floor).
+    var livePauseNote: AtriaLiveDataNote? = nil
+
+    /// A power-policy pause (not the history catch-up note).
+    var liveIsPausedByPower: Bool {
+        guard let livePauseNote else { return false }
+        return livePauseNote != .catchingUpHistory
+    }
+
+    /// "Live steps paused · strap 12%" becomes the tile's reason line.
+    private var pausedFromHistoryText: String {
+        let reason = livePauseNote.map(\.text) ?? "Live steps paused"
+        if let capturedAt, count != nil {
+            return "History through "
+                + capturedAt.formatted(date: .omitted, time: .shortened)
+                + " · " + reason.replacingOccurrences(of: "Live steps paused", with: "live paused")
+        }
+        return reason + " · from strap history"
+    }
+
+    /// Overrides the forward-looking "fills in as your strap syncs" line when the
+    /// exact motion authority proves it will not. The verified count/coverage are
+    /// untouched — only the progress promise changes. Returns nil to keep the
+    /// existing copy for live/catchingUp/qualifying/stale and unclassified.
+    var motionAvailabilityFootnote: String? {
+        if liveIsPausedByPower, completeness != .complete {
+            return "Live steps are paused to save battery. This count comes from "
+                + "strap history and grows as it syncs."
+        }
+        switch motionAvailability {
+        case .unavailableInCurrentTransport:
+            return "Motion is unavailable in the current connection mode. "
+                + "Live heart rate is still connected."
+        case .unknown:
+            return "Counted so far — updates when motion syncs."
+        case .live, .catchingUp, .qualifying, .stale, .none:
+            return nil
+        }
+    }
+
+    /// Compact recovery is still required. Native leftover R10 and 1 Hz
+    /// history must not be described as gap fill or compact gait.
+    var productHonestyFootnote: String? {
+        switch productRoute {
+        case .nativeR10Observed:
+            return "Observed native motion only while frames arrive. Not compact 0x33 gait."
+        case .historicalGravity1Hz:
+            return "1 Hz history is not 100 Hz gait and is not equal-quality backfill."
+        case .compactLive, .unspecified:
+            return nil
+        }
+    }
+
+    var valueText: String {
+        // A verified-but-partial count is a LOWER BOUND over the fraction of
+        // the day the motion bank was armed and the cadence model qualified —
+        // not a day total. Dropping the qualifier here (2026-08-12) left the
+        // partial/complete distinction visible only in `detailText`, behind a
+        // tap, and in `accessibilityText`, which is VoiceOver-only. The widget
+        // fed by the very same snapshot kept rendering "≥N"
+        // (AtriaWidget.swift:142-145), so the app and its own widget disagreed
+        // about the same number — and the app was the dishonest one. A user
+        // reading a bare "176" reasonably concludes the step counter is broken
+        // (field report 2026-08-19, item 7) rather than that it is reporting a
+        // floor over partial coverage. Say what the number is.
+        guard let count else { return "--" }
+        // A zero observed inside a small archive fragment is not a zero for
+        // the day. Showing it as one makes an absence of evidence look like a
+        // completed step total (for example "0 · 3% covered").
+        guard completeness != .partial || count > 0 else { return "--" }
+        // 2026-08-21 user directive: drop the "≥" lower-bound prefix entirely.
+        // The partial/open-cycle nature is still carried in detailText
+        // ("Counted through 8:12 AM" / "Today so far · estimate") and in the
+        // accessibility text; the hero number itself is now just the number, so
+        // it reads as a real step count instead of looking broken.
+        return "\(count)"
+    }
+
+    var detailText: String {
+        if liveIsPausedByPower, completeness != .complete,
+           unavailabilityReason != .priorCycleReceiptOnly,
+           unavailabilityReason != .conflictingExactReceipts {
+            return pausedFromHistoryText
+        }
+        switch (source, completeness) {
+        case (.verifiedCanonical, .complete):
+            if isOpenCycle {
+                return openCycleReceiptIsCurrent
+                    ? "Today so far · verified"
+                    : verifiedThroughText
+            }
+            return "Verified complete day"
+        case (.verifiedCanonical, .partial):
+            // 2026-08-12 user decision: the glance line must NOT lead with a
+            // coverage percent. The number is honest (how much of the elapsed
+            // day the strap actually recorded step-motion for — a data-
+            // coverage figure, not a sync grade and not an activity level),
+            // but "32% covered/tracked" reliably reads as "the strap is
+            // detecting my steps wrong". On the HR-only radio mode the strap
+            // only banks motion in short windows, so a fully-synced day
+            // legitimately reads low (~1h of motion over a 14h day). The
+            // frontier timestamp says the same true thing — this count is
+            // what's known up to that time — without the failure connotation.
+            // The explained percent stays available in `accessibilityText`.
+            // Never say "synced" (reads as "barely uploaded") and never say
+            // "moving" (reads as "you were only active N%").
+            if let capturedAt {
+                return "Counted through "
+                    + capturedAt.formatted(date: .omitted, time: .shortened)
+            }
+            return coverageFraction != nil ? "Partial day so far" : "Syncing steps"
+        case (.live, .partial):
+            if unavailabilityReason == .heldWhileMotionSyncing {
+                if let capturedAt {
+                    return "Last count · syncing · through "
+                        + capturedAt.formatted(date: .omitted, time: .shortened)
+                }
+                return "Last count · motion syncing"
+            }
+            return isValidated
+                ? productRoute.liveDetailText
+                : productRoute.liveEstimateDetailText
+        default:
+            switch unavailabilityReason {
+            case .priorCycleReceiptOnly:
+                guard let priorCycleReceipt else {
+                    return "No verified receipt for this cycle"
+                }
+                // The prior count is a lower bound: its cycle may have ended
+                // with unbanked motion. Never present it as today's value.
+                // Plain-language pass (2026-08-01): when the prior cycle ended
+                // on the previous civil day — or overnight today before 6 AM,
+                // which humans still read as "yesterday's total" — say
+                // "Yesterday" instead of the technical "Prior cycle … ended".
+                if priorCycleReadsAsYesterday(priorCycleReceipt) {
+                    return "Yesterday: \(priorCycleReceipt.steps)"
+                }
+                return "Prior cycle: \(priorCycleReceipt.steps) · ended "
+                    + priorCycleReceipt.endedAt.formatted(
+                        date: .omitted,
+                        time: .shortened
+                    )
+            case .staleLiveReceipt:
+                return "Last step count is no longer live"
+            case .heldWhileMotionSyncing:
+                return "Last count · motion syncing"
+            case .unvalidatedLiveReceipt:
+                return "Steps are still validating"
+            case .motionObservedCountUnresolved:
+                return "Steps found · count still resolving"
+            case .conflictingExactReceipts:
+                return "Conflicting verified strap receipts"
+            case .stepModelNotQualified:
+                return "Step model is still validating"
+            case .none, .noCurrentCycleReceipt:
+                return "No verified receipt for this cycle"
+            }
+        }
+    }
+
+    var accessibilityText: String {
+        guard let count,
+              !(completeness == .partial && count == 0) else {
+            return "Step count unavailable. \(detailText)."
+        }
+        switch (source, completeness) {
+        case (.verifiedCanonical, .complete):
+            if isOpenCycle {
+                return openCycleReceiptIsCurrent
+                    ? "\(count) verified steps today so far."
+                    : "\(count) steps. \(verifiedThroughText)."
+            }
+            return "\(count) steps. Verified complete day."
+        case (.verifiedCanonical, .partial):
+            let coverage = coverageFraction.map {
+                "motion tracked for \(Int(($0 * 100).rounded())) percent of your day"
+            } ?? "partially tracked"
+            let frontier = capturedAt.map {
+                ", through \($0.formatted(date: .omitted, time: .shortened))"
+            } ?? ""
+            return "\(count) steps so far, \(coverage)\(frontier)."
+        case (.live, .partial):
+            if unavailabilityReason == .heldWhileMotionSyncing {
+                let frontier = capturedAt.map {
+                    " through \($0.formatted(date: .omitted, time: .shortened))"
+                } ?? ""
+                return "\(count) steps counted\(frontier). Motion syncing."
+            }
+            return "\(isValidated ? "\(count)" : "Approximately \(count)") steps today so far."
+        default:
+            return "Step count unavailable."
+        }
+    }
+
+    /// The prior cycle reads as "yesterday's total" when its END fell on the
+    /// previous civil day, or on today's civil day before 6 AM (an overnight
+    /// close like 1:44 AM is still last night's total to a human). Any older
+    /// or later end keeps the precise "Prior cycle … ended" disclosure.
+    /// Pure and calendar-injectable so the boundary is unit-testable.
+    func priorCycleReadsAsYesterday(_ receipt: PriorCycleReceipt,
+                                    calendar: Calendar = .current) -> Bool {
+        guard let yesterday = calendar.date(byAdding: .day, value: -1, to: day) else {
+            return false
+        }
+        if calendar.isDate(receipt.endedAt, inSameDayAs: yesterday) { return true }
+        guard calendar.isDate(receipt.endedAt, inSameDayAs: day),
+              let sixAM = calendar.date(byAdding: .hour, value: 6, to: calendar.startOfDay(for: day))
+        else { return false }
+        return receipt.endedAt < sixAM
+    }
+
+    private var verifiedThroughText: String {
+        guard let capturedAt else { return "Verified earlier in this cycle" }
+        return "Verified through \(capturedAt.formatted(date: .omitted, time: .shortened))"
+    }
+
+    static func resolve(
+        day: Date,
+        now: Date,
+        liveCount: Int,
+        liveValidationState: String,
+        liveCapturedAt: Date?,
+        canonicalDays: [AtriaHistoricalDailyConsumerProjection.StepDay],
+        /// The connected live detector is a product source only after the same
+        /// model has passed autonomous counted walks and arm-motion controls.
+        /// Research counters remain available to diagnostics but cannot leak
+        /// onto Home or widgets.
+        liveAuthorityQualified: Bool = true,
+        /// Live strap totals are attributed wake-to-wake. When a completed
+        /// main sleep has not arrived, this can deliberately begin on the
+        /// preceding civil date; a fresh post-midnight sample must still be
+        /// eligible to keep the active day visible.
+        physiologicalDayStart: Date? = nil,
+        /// 2026-07-31: newest receipt ending before the current wake boundary,
+        /// disclosed in copy only when the open cycle has nothing to show.
+        priorCycleReceipt: PriorCycleReceipt? = nil,
+        /// 2026-08-22: the current wake boundary is an UNCONFIRMED no-sleep
+        /// fallback (a synthetic civil-day rollover), not a confirmed main
+        /// sleep. For a shifted sleeper whose real sleep was not detected, that
+        /// synthetic boundary splits ONE continuous active period in two,
+        /// stranding the already-counted steps in the "prior" cycle while the
+        /// fresh cycle shows "--". When true, the prior receipt is carried
+        /// forward as this open cycle's verified-partial floor instead — the
+        /// steps belong to the same unbroken wear period. `false` (the default,
+        /// and always for a confirmed-sleep boundary) preserves the strict
+        /// "prior steps are never attributed to today" behavior.
+        boundaryIsUnconfirmedFallback: Bool = false,
+        /// Last in-cycle count persisted while IMU was live. Used only when the
+        /// current merge is 0 (checkpoint swallowed today's prefix) or IMU is
+        /// silent. Never crosses a wake boundary.
+        heldCount: Int = 0,
+        heldCapturedAt: Date? = nil,
+        calendar: Calendar = .current
+    ) -> Self {
+        if AtriaAppReviewDemo.isActive,
+           let demoCount = AtriaAppReviewDemo.stepCount(on: day, now: now, calendar: calendar) {
+            let dayStart = calendar.startOfDay(for: day)
+            let isToday = calendar.isDate(dayStart, inSameDayAs: now)
+            return .init(day: dayStart,
+                         count: demoCount,
+                         completeness: isToday ? .partial : .complete,
+                         source: .verifiedCanonical,
+                         isValidated: true,
+                         capturedAt: now,
+                         coverageFraction: 1,
+                         isOpenCycle: isToday,
+                         openCycleReceiptIsCurrent: true)
+        }
+        let dayStart = calendar.startOfDay(for: day)
+        let isToday = calendar.isDate(dayStart, inSameDayAs: now)
+        let activeWindowStart = physiologicalDayStart ?? dayStart
+        let usesPhysiologicalOpenWindow = physiologicalDayStart != nil
+            && activeWindowStart <= now
+        let isOpenDay = isToday || usesPhysiologicalOpenWindow
+        // A prior-cycle receipt may be carried into THIS open cycle only when it
+        // ABUTS the wake boundary: the same continuous, unbroken wear period cut
+        // in two by a synthetic civil-day line, the prior cycle ending where this
+        // one begins. A receipt whose drained frontier sits more than one
+        // physiological cycle before the boundary means at least one whole cycle
+        // drained nothing in between — the motion transport was in pure-HR
+        // fallback, or the strap was off — so it is stale history, never today's
+        // count. (2026-09-07: a step receipt frozen at 135 steps, whose drained
+        // frontier had been stuck three days earlier while R10 sat in pure-HR
+        // fallback, was being promoted to the open cycle's hero number and the
+        // widget value as if it were today's total.) The abutting-fallback carry
+        // fixtures end ~41 min before the boundary and stay green.
+        let priorReceiptAbutsOpenCycle = priorCycleReceipt.map {
+            activeWindowStart.timeIntervalSince($0.endedAt)
+                <= AtriaPhysiologicalCycle.maximumLearnedInterval
+        } ?? false
+        let heldCapturedInCycle = heldCount > 0 && heldCapturedAt.map {
+            $0 >= activeWindowStart && $0 <= now.addingTimeInterval(5)
+        } == true
+        let livePositive = max(0, liveCount)
+        let rawHeld = heldCapturedInCycle ? heldCount : 0
+        let heldPositive = AtriaHeldDailyStepFloor.usableHeldCount(
+            held: rawHeld,
+            live: livePositive,
+            heldCapturedAt: heldCapturedAt,
+            liveCapturedAt: liveCapturedAt,
+            now: now
+        )
+        let mergedCandidate = max(livePositive, heldPositive)
+        let mergedLiveCapturedAt: Date? = {
+            if heldPositive > livePositive { return heldCapturedAt }
+            if livePositive > 0 { return liveCapturedAt }
+            return heldCapturedInCycle ? heldCapturedAt : liveCapturedAt
+        }()
+        let mergedLiveCount = Self.plausibleOpenCycleStepCount(
+            count: mergedCandidate,
+            windowStart: activeWindowStart,
+            capturedAt: mergedLiveCapturedAt
+        ) ?? 0
+        let liveCapturedInCycle = mergedLiveCapturedAt.map {
+            $0 >= activeWindowStart && $0 <= now.addingTimeInterval(5)
+        } ?? false
+        let liveBelongsToDay = liveCapturedInCycle
+            && mergedLiveCapturedAt.map {
+                now.timeIntervalSince($0) <= liveEvidenceMaximumAge
+            } ?? false
+        let liveIsValidated = WidgetSnapshotPublisher.strapStepsAreValidated(
+            state: liveValidationState
+        )
+        let resolvedProductRoute = AtriaStrapMotionProductRoute.resolve(
+            validationState: liveValidationState
+        )
+        let physiologicalMatching = usesPhysiologicalOpenWindow
+            ? canonicalDays.filter {
+                abs($0.dayStart.timeIntervalSince(activeWindowStart)) < 1
+            }
+            : []
+
+        let civilMatching = canonicalDays.filter {
+            calendar.isDate($0.dayStart, inSameDayAs: dayStart)
+        }
+        // A current wake-to-wake v24 projection is more specific than a civil
+        // archive day. Under a physiological open window ONLY a receipt with
+        // that exact wake boundary may speak for the cycle (2026-08-30): the
+        // old empty-match fallthrough to `civilMatching` let a stale civil
+        // archive row masquerade as the open cycle after a wake rollover, so
+        // "today" showed a differently-bounded subtotal as if it were this
+        // cycle's. With no physiological match the archive branches below see
+        // nothing and the resolver reaches its existing honest states (live
+        // evidence, prior-cycle disclosure, or `.noCurrentCycleReceipt`).
+        // Civil-day callers (no `physiologicalDayStart`, e.g. history rows)
+        // keep the civil match byte-identical.
+        let matching = usesPhysiologicalOpenWindow
+            ? physiologicalMatching
+            : civilMatching
+        let completeCounts = Set(matching.compactMap { candidate -> Int? in
+            guard candidate.state == .available || candidate.state == .knownEmpty else {
+                return nil
+            }
+            return candidate.stepCount
+        })
+        // Conflicting exact generations are withheld instead of selecting a
+        // convenient number. A later repaired page can resolve the conflict.
+        if completeCounts.count == 1, let exact = completeCounts.first {
+            let capturedAt = matching.map(\.dayEnd).max()
+            let capturedAge = capturedAt.map { now.timeIntervalSince($0) }
+            let openCycleReceiptIsCurrent = capturedAge.map {
+                $0 >= -5 && $0 <= liveEvidenceMaximumAge
+            } ?? false
+            // Complete means complete through the receipt's end, not through
+            // the rest of an open cycle. A newer validated live total can
+            // advance that subtotal without adding overlapping observations.
+            if isOpenDay,
+               liveAuthorityQualified,
+               liveBelongsToDay,
+               liveIsValidated,
+               mergedLiveCount > exact,
+               let liveCapturedAt = mergedLiveCapturedAt,
+               let capturedAt,
+               liveCapturedAt > capturedAt {
+                return .init(day: dayStart,
+                             count: mergedLiveCount,
+                             completeness: .partial,
+                             source: .live,
+                             isValidated: true,
+                             capturedAt: liveCapturedAt,
+                             coverageFraction: nil,
+                             isOpenCycle: true,
+                             productRoute: resolvedProductRoute)
+            }
+            return .init(day: dayStart,
+                         count: exact,
+                         completeness: .complete,
+                         source: .verifiedCanonical,
+                         isValidated: true,
+                         capturedAt: capturedAt,
+                         coverageFraction: 1,
+                         isOpenCycle: isOpenDay,
+                         openCycleReceiptIsCurrent: openCycleReceiptIsCurrent)
+        }
+        if completeCounts.count > 1 {
+            return .init(day: dayStart,
+                         count: nil,
+                         completeness: .unavailable,
+                         source: .none,
+                         isValidated: false,
+                         capturedAt: nil,
+                         coverageFraction: nil,
+                         unavailabilityReason: .conflictingExactReceipts,
+                         isOpenCycle: isOpenDay)
+        }
+        let partial = completeCounts.isEmpty
+            ? matching
+            .filter({ $0.state == .missing && $0.knownCoverageSeconds > 0 })
+            .max(by: {
+                if $0.knownCoverageSeconds != $1.knownCoverageSeconds {
+                    return $0.knownCoverageSeconds < $1.knownCoverageSeconds
+                }
+                return $0.knownEpochCount < $1.knownEpochCount
+            })
+            : nil
+        let hasUnresolvedMotionReceipt = matching.contains {
+            $0.state == .missing
+                && $0.knownEpochCount > 0
+                && $0.knownCoverageSeconds == 0
+        }
+        // A live strap subtotal is only an open-day source while its
+        // detector-applied coordinate is fresh. A restored prefix is retained
+        // in the strap detail view as "Not live", but it cannot silently
+        // masquerade as today's current count. Once validated, this exact
+        // current-cycle coordinate can advance an older partial archive lower
+        // bound (without summing them), but cannot erase a larger drained count.
+        // Exact receipts and their conflicts are reconciled above.
+        if liveAuthorityQualified,
+           isOpenDay,
+           liveBelongsToDay,
+           liveIsValidated,
+           mergedLiveCount >= (partial?.knownStepDeltaSum ?? 0) {
+            return .init(day: dayStart,
+                         count: max(0, mergedLiveCount),
+                         completeness: .partial,
+                         source: .live,
+                         isValidated: true,
+                         capturedAt: mergedLiveCapturedAt,
+                         coverageFraction: nil,
+                         isOpenCycle: isOpenDay,
+                         productRoute: resolvedProductRoute)
+        }
+        // A same-cycle live detector coordinate is a real observed count for
+        // today even when it is no longer inside the strict live-freshness
+        // window or has not yet been cross-validated. The oldest-first drain
+        // means the durable partial can freeze on a tiny early-morning slice
+        // (2026-08-21 report: "stuck at 200"); when the live count is genuinely
+        // ahead of that slice it is the better, more up-to-date lower bound.
+        // This only ever RAISES the shown number to a real observation — it
+        // never fabricates or extrapolates a step.
+        let liveInCycle = liveAuthorityQualified
+            && isOpenDay
+            && mergedLiveCount > 0
+            && (mergedLiveCapturedAt.map {
+                $0 >= activeWindowStart && $0 <= now.addingTimeInterval(5)
+            } ?? false)
+        // Without a fresh validated live coordinate, the best durable partial
+        // remains the honest lower bound for the active cycle — unless the live
+        // detector has observed more of the day than has drained so far.
+        if let partial {
+            let banked = partial.knownStepDeltaSum
+            let total = partial.knownCoverageSeconds + partial.missingCoverageSeconds
+            let coverageFraction = total > 0
+                ? Double(partial.knownCoverageSeconds) / Double(total) : nil
+            // Only fill the gap with the live estimate while verified coverage is
+            // low; a high-coverage verified count is the trustworthy total.
+            let liveMayFillGap = (coverageFraction ?? 1) < liveEstimateCoverageCeiling
+            // Device 2026-09-11: unvalidated preliminary live (gain-inflated
+            // R10) was raising a real drained floor, then snapping back —
+            // the hero number swayed in both directions. Only a validated
+            // live coordinate may fill a low-coverage gap. Preliminary
+            // estimates still surface when there is no drained floor.
+            let liveObserved = (liveInCycle && liveIsValidated && liveMayFillGap)
+                ? max(0, mergedLiveCount) : 0
+            // Across an unconfirmed no-sleep fallback the prior receipt is the
+            // SAME continuous wear period as this partial (disjoint windows:
+            // prior ends at the synthetic boundary, this partial begins there).
+            // Keep it as a floor so the freshly-rolled cycle's small early slice
+            // never regresses the shown number below what this active period had
+            // already counted. This only ever RAISES to a real measured prior
+            // count; it never sums (no double-count) and never fabricates.
+            let carriedFloor = (boundaryIsUnconfirmedFallback && priorReceiptAbutsOpenCycle)
+                ? max(0, priorCycleReceipt?.steps ?? 0)
+                : 0
+            let usesCarried = carriedFloor > banked && carriedFloor >= liveObserved
+            let usesLive = liveObserved > banked && liveObserved > carriedFloor
+            let carriedEndedAt = priorCycleReceipt?.endedAt
+            // When the carried floor wins, the shown count is the prior cycle's
+            // total, captured through the prior receipt's own frontier — NOT the
+            // freshly-rolled cycle's tiny coverage. Reporting this partial's
+            // small coverageFraction/dayEnd here would make accessibilityText
+            // say "N steps so far, motion tracked for 4 percent of your day",
+            // pairing a near-complete total with a coverage figure that does not
+            // describe it. Mirror the no-partial carry below: nil coverage and
+            // the carried frontier, so VoiceOver reads "partially tracked".
+            return .init(day: dayStart,
+                         count: max(banked, liveObserved, carriedFloor),
+                         completeness: .partial,
+                         source: usesLive ? .live : .verifiedCanonical,
+                         isValidated: usesLive ? liveIsValidated : true,
+                         capturedAt: usesCarried
+                            ? carriedEndedAt
+                            : (usesLive ? mergedLiveCapturedAt : partial.dayEnd),
+                         coverageFraction: usesCarried ? nil : coverageFraction,
+                         isOpenCycle: isOpenDay,
+                         carriedFromUnconfirmedPriorCycle: usesCarried)
+        }
+        // 2026-08-22 (owner-approved, REC-1): surface the live IMU gyro-cadence
+        // estimate as the open cycle's number even with NO drained floor, rather
+        // than withholding it. The strap's oldest-first drain can leave today with
+        // zero drained coverage for hours while the user has walked thousands of
+        // steps; the live model is the only up-to-date signal in that window and it
+        // is honest to show it AS AN ESTIMATE. Honesty-first LAW is preserved: this
+        // stays source=.live + isValidated=false, so copy reads "Approximately N
+        // steps" / "Today so far · estimate", never an exact count. The former
+        // concern (an unvalidated count could be arbitrarily wrong) is bounded by a
+        // physiological cadence clamp: the estimate cannot exceed what is humanly
+        // possible in the elapsed active window. An over-ceiling count is
+        // withheld rather than rewritten as the ceiling. Only reached when there is no
+        // partial (the raise-above-floor path above already owns the stuck-low case)
+        // and a FRESH in-cycle live coordinate exists; HR-only radio mode has
+        // liveCount==0, so this never fires there and the honest states below stand.
+        // Freshness is required for a LIVE label (liveBelongsToDay). A stale
+        // in-cycle coordinate is still today's counted floor while IMU recovers;
+        // hiding it as "--" made a radio hitch look like a broken step counter
+        // (device 2026-09-14: ledger 11854, widget "-- / Waiting for strap").
+        // Compact receipt with firmware ticks and a zero gait subtotal is
+        // unresolved cadence, not "no drained floor". A live IMU estimate
+        // would paper over that as "Today so far · estimate" (store test:
+        // observed motion, steps=0, live 4257 clamped to 2100).
+        let liveEstimateEligible = liveAuthorityQualified
+            && isOpenDay
+            && liveBelongsToDay
+            && mergedLiveCount > 0
+            && !hasUnresolvedMotionReceipt
+        if liveEstimateEligible {
+            return .init(day: dayStart,
+                         count: mergedLiveCount,
+                         completeness: .partial,
+                         source: .live,
+                         isValidated: false,
+                         capturedAt: mergedLiveCapturedAt,
+                         coverageFraction: nil,
+                         isOpenCycle: isOpenDay,
+                         productRoute: resolvedProductRoute)
+        }
+        let liveHoldEligible = liveAuthorityQualified
+            && isOpenDay
+            && liveCapturedInCycle
+            && mergedLiveCount > 0
+            && !hasUnresolvedMotionReceipt
+        if liveHoldEligible {
+            return .init(day: dayStart,
+                         count: mergedLiveCount,
+                         completeness: .partial,
+                         source: .live,
+                         isValidated: false,
+                         capturedAt: mergedLiveCapturedAt,
+                         coverageFraction: nil,
+                         unavailabilityReason: .heldWhileMotionSyncing,
+                         isOpenCycle: isOpenDay,
+                         productRoute: resolvedProductRoute)
+        }
+        // No in-cycle count to hold and no drained floor: keep the specific
+        // unavailable reasons below (still-validating / no receipt / prior cycle).
+        let emptyReason: UnavailabilityReason =
+            !liveAuthorityQualified
+                ? .stepModelNotQualified
+                : (hasUnresolvedMotionReceipt
+                ? .motionObservedCountUnresolved
+                : (mergedLiveCapturedAt == nil
+                    ? .noCurrentCycleReceipt
+                    : (liveBelongsToDay
+                       ? .unvalidatedLiveReceipt
+                       : .staleLiveReceipt)))
+        // 2026-07-31: when the no-sleep fallback rolls the wake boundary, the
+        // fresh cycle legitimately has no receipt and no live sample yet.
+        // Disclose the prior cycle's verified subtotal in copy instead of an
+        // unexplained "--", while the count itself stays nil so prior steps
+        // are never attributed to today. A live sample captured before the
+        // boundary is that same prior cycle, not a stale sample of this one.
+        let staleLiveIsFromPriorCycle = emptyReason == .staleLiveReceipt
+            && mergedLiveCapturedAt.map { $0 < activeWindowStart } == true
+        // Only an abutting prior receipt is disclosed as "prior cycle". A
+        // receipt stranded more than one physiological cycle back is stale
+        // history: disclosing "Prior cycle: 135 · ended 9:44 AM" (the time
+        // formats without a date) would present a three-day-old frontier as if
+        // it were the immediately preceding cycle. Fall through to the plain
+        // "No verified receipt for this cycle" honest state instead.
+        let disclosesPriorCycle = priorCycleReceipt != nil
+            && priorReceiptAbutsOpenCycle
+            && (emptyReason == .noCurrentCycleReceipt
+                || staleLiveIsFromPriorCycle)
+        // 2026-08-22: when this cycle rolled on an UNCONFIRMED no-sleep
+        // fallback and has drained nothing of its own yet, the prior receipt is
+        // the same continuous wear period artificially cut in two by a
+        // synthetic civil-day boundary. Carrying it forward as the open cycle's
+        // verified-partial floor shows the real count already recorded this
+        // wake ("1118 · Counted through 7:02 AM") instead of a broken-looking
+        // "--" with the total stranded in "Yesterday". It is a real measured
+        // count, never fabricated, and self-corrects: once this cycle drains
+        // its own coverage the partial branch above takes over, and once a real
+        // sleep is confirmed the boundary becomes `.mainSleep` and the strict
+        // split returns. A confirmed-sleep boundary (the default) never enters
+        // here — a real new day must not inherit yesterday's steps.
+        if disclosesPriorCycle,
+           boundaryIsUnconfirmedFallback,
+           priorReceiptAbutsOpenCycle,
+           let carried = priorCycleReceipt,
+           carried.steps > 0 {
+            return .init(day: dayStart,
+                         count: carried.steps,
+                         completeness: .partial,
+                         source: .verifiedCanonical,
+                         isValidated: true,
+                         capturedAt: carried.endedAt,
+                         coverageFraction: nil,
+                         isOpenCycle: isOpenDay,
+                         carriedFromUnconfirmedPriorCycle: true)
+        }
+        return .init(day: dayStart,
+                     count: nil,
+                     completeness: .unavailable,
+                     source: .none,
+                     isValidated: false,
+                     capturedAt: nil,
+                     coverageFraction: nil,
+                     unavailabilityReason: disclosesPriorCycle
+                        ? .priorCycleReceiptOnly
+                        : emptyReason,
+                     isOpenCycle: isOpenDay,
+                     priorCycleReceipt: disclosesPriorCycle
+                        ? priorCycleReceipt
+                        : nil)
+    }
+}
+
+/// Last in-cycle strap count that was actually shown. IMU silence or a
+/// session checkpoint that equals the live cumulative used to collapse
+/// today's merge to 0 and the widget to "--". This floor is keyed to the
+/// wake boundary and is never a retention/raw candidate.
+enum AtriaHeldDailyStepFloor {
+    static let countKey = "atria.steps.heldDailyCount"
+    static let cycleKey = "atria.steps.heldDailyCycleStart"
+    static let capturedKey = "atria.steps.heldDailyCapturedAt"
+    static let liveGyroTodayCountKey = "atria.steps.liveGyroTodayCount"
+    static let liveGyroTodayCapturedKey = "atria.steps.liveGyroTodayCapturedAt"
+    static let liveGyroTodayCycleKey = "atria.steps.liveGyroTodayCycleStart"
+
+    static func persist(count: Int,
+                        cycleStart: Date,
+                        capturedAt: Date?,
+                        defaults: UserDefaults = .standard) {
+        guard count > 0 else { return }
+        if let existing = load(cycleStart: cycleStart, defaults: defaults),
+           count < existing.count,
+           !shouldReplaceContaminatedHeld(
+                existing: existing.count,
+                incoming: count,
+                sameCycle: true,
+                trustedPrefix: 0
+           ) {
+            return
+        }
+        defaults.set(count, forKey: countKey)
+        defaults.set(cycleStart.timeIntervalSince1970, forKey: cycleKey)
+        if let capturedAt {
+            defaults.set(capturedAt.timeIntervalSince1970, forKey: capturedKey)
+        } else {
+            defaults.removeObject(forKey: capturedKey)
+        }
+    }
+
+    /// BLE/ledger producer. Does not require the wake boundary; `load`
+    /// still refuses to attribute a capturedAt before the current cycle.
+    static let contaminationSlack = 30
+    static let maximumPlausibleStepsPerSecond = 6.0
+
+    static func resetForNewCycle(cycleStart: Date,
+                                 defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: countKey)
+        defaults.removeObject(forKey: capturedKey)
+        defaults.set(cycleStart.timeIntervalSince1970, forKey: cycleKey)
+        defaults.removeObject(forKey: liveGyroTodayCountKey)
+        defaults.removeObject(forKey: liveGyroTodayCapturedKey)
+        defaults.removeObject(forKey: liveGyroTodayCycleKey)
+    }
+
+    static func storedCycleMatches(_ cycleStart: Date?,
+                                   defaults: UserDefaults) -> Bool {
+        guard let cycleStart else { return false }
+        let stored = defaults.double(forKey: cycleKey)
+        return stored > 0
+            && abs(stored - cycleStart.timeIntervalSince1970) < 1
+    }
+
+    /// Gyro today of 18 vs a leftover 9482 floor is not a dropout (dropout
+    /// is live == 0). A trusted all-time prefix may also replace accel peaks.
+    static func shouldReplaceContaminatedHeld(existing: Int,
+                                              incoming: Int,
+                                              sameCycle: Bool,
+                                              trustedPrefix: Int) -> Bool {
+        let existing = max(0, existing)
+        let incoming = max(0, incoming)
+        guard incoming > 0,
+              existing > incoming + contaminationSlack else { return false }
+        if trustedPrefix > 0, incoming >= trustedPrefix { return true }
+        return sameCycle && existing > incoming * 2
+    }
+
+    static func persistLiveCoordinate(count: Int,
+                                      capturedAt: Date,
+                                      cycleStart: Date? = nil,
+                                      trustedPrefix: Int = 0,
+                                      defaults: UserDefaults = .standard) {
+        guard count > 0 else { return }
+        let existingCount = defaults.integer(forKey: countKey)
+        let existingCaptured = (defaults.object(forKey: capturedKey) as? Double)
+            .map(Date.init(timeIntervalSince1970:))
+        if existingCount > 0 {
+            if count > existingCount {
+                if let existingCaptured,
+                   !stepIncrementIsPlausible(
+                    from: existingCount,
+                    to: count,
+                    startedAt: existingCaptured,
+                    endedAt: capturedAt
+                   ) {
+                    return
+                }
+            } else if count < existingCount {
+                let sameCycle = storedCycleMatches(cycleStart, defaults: defaults)
+                let cycleChanged = cycleStart.map { start in
+                    let stored = defaults.double(forKey: cycleKey)
+                    return stored <= 0
+                        || abs(stored - start.timeIntervalSince1970) >= 1
+                } ?? false
+                let canReplaceContamination = cycleChanged
+                    || shouldReplaceContaminatedHeld(
+                        existing: existingCount,
+                        incoming: count,
+                        sameCycle: sameCycle,
+                        trustedPrefix: trustedPrefix
+                    )
+                if !canReplaceContamination { return }
+            }
+        }
+        defaults.set(count, forKey: countKey)
+        defaults.set(capturedAt.timeIntervalSince1970, forKey: capturedKey)
+        if let cycleStart {
+            defaults.set(cycleStart.timeIntervalSince1970, forKey: cycleKey)
+        } else {
+            // An unkeyed live coordinate must not keep yesterday's wake key.
+            defaults.removeObject(forKey: cycleKey)
+        }
+    }
+
+    static func persistLiveGyroToday(count: Int,
+                                     capturedAt: Date,
+                                     cycleStart: Date? = nil,
+                                     defaults: UserDefaults = .standard,
+                                     calendar: Calendar = .current) {
+        let incoming = max(0, count)
+        guard incoming > 0 else { return }
+        if let cycleStart {
+            guard capturedAt >= cycleStart.addingTimeInterval(-5),
+                  AtriaDailyStepPresentation.plausibleOpenCycleStepCount(
+                    count: incoming,
+                    windowStart: cycleStart,
+                    capturedAt: capturedAt
+                  ) != nil else {
+                return
+            }
+        }
+        if let existing = loadLiveGyroToday(
+            now: capturedAt,
+            cycleStart: cycleStart,
+            defaults: defaults,
+            calendar: calendar
+        ), incoming < existing.count {
+            return
+        }
+        defaults.set(incoming, forKey: liveGyroTodayCountKey)
+        defaults.set(capturedAt.timeIntervalSince1970, forKey: liveGyroTodayCapturedKey)
+        if let cycleStart {
+            defaults.set(cycleStart.timeIntervalSince1970, forKey: liveGyroTodayCycleKey)
+        }
+    }
+
+    static func loadLiveGyroToday(
+        now: Date = Date(),
+        cycleStart: Date? = nil,
+        defaults: UserDefaults = .standard,
+        calendar: Calendar = .current
+    ) -> (count: Int, capturedAt: Date)? {
+        let count = defaults.integer(forKey: liveGyroTodayCountKey)
+        guard count > 0,
+              let captured = (defaults.object(forKey: liveGyroTodayCapturedKey) as? Double)
+                .map(Date.init(timeIntervalSince1970:)) else {
+            return nil
+        }
+        if let cycleStart {
+            if captured < cycleStart.addingTimeInterval(-5) { return nil }
+            let storedCycle = defaults.double(forKey: liveGyroTodayCycleKey)
+            if storedCycle > 0,
+               abs(storedCycle - cycleStart.timeIntervalSince1970) >= 1 {
+                return nil
+            }
+            guard AtriaDailyStepPresentation.plausibleOpenCycleStepCount(
+                count: count,
+                windowStart: cycleStart,
+                capturedAt: captured
+            ) != nil else {
+                return nil
+            }
+            return (count, captured)
+        }
+        guard calendar.isDate(captured, inSameDayAs: now) else {
+            return nil
+        }
+        return (count, captured)
+    }
+
+    static func stepIncrementIsPlausible(from startCount: Int,
+                                         to endCount: Int,
+                                         startedAt: Date,
+                                         endedAt: Date,
+                                         maximumStepsPerSecond: Double = maximumPlausibleStepsPerSecond) -> Bool {
+        guard endCount > startCount else { return true }
+        let dt = max(0.5, endedAt.timeIntervalSince(startedAt))
+        return Double(endCount - startCount) / dt <= maximumStepsPerSecond
+    }
+
+    /// Accel-peak / historical-IMU contamination can ratchet the held floor
+    /// thousands of steps. Live gyro in this cycle is the truth when it is
+    /// actually flowing. Dropout is `live == 0` and keeps the floor.
+    static func usableHeldCount(held: Int,
+                                live: Int,
+                                heldCapturedAt: Date?,
+                                liveCapturedAt: Date?,
+                                now: Date) -> Int {
+        let held = max(0, held)
+        let live = max(0, live)
+        if live > 0,
+           shouldReplaceContaminatedHeld(
+            existing: held,
+            incoming: live,
+            sameCycle: true,
+            trustedPrefix: 0
+           ) {
+            return live
+        }
+        guard held > live + contaminationSlack, live > 0 else { return held }
+        let start = min(heldCapturedAt ?? now, liveCapturedAt ?? now)
+        let end = max(heldCapturedAt ?? now, liveCapturedAt ?? now)
+        if stepIncrementIsPlausible(from: live, to: held, startedAt: start, endedAt: end) {
+            return held
+        }
+        return live
+    }
+
+    static func load(cycleStart: Date,
+                     now: Date = Date(),
+                     defaults: UserDefaults = .standard) -> (count: Int, capturedAt: Date?)? {
+        let count = defaults.integer(forKey: countKey)
+        guard count > 0 else { return nil }
+        let capturedRaw = defaults.object(forKey: capturedKey) as? Double
+        let captured = capturedRaw.map(Date.init(timeIntervalSince1970:))
+        let storedCycle = defaults.double(forKey: cycleKey)
+        // A live coordinate without a wake key used to attach to the next
+        // confirmed sleep because capturedAt was "now". Sleep confirm must
+        // start a new day's count; only a matching cycle key may speak.
+        _ = now
+        guard storedCycle > 0,
+              abs(Date(timeIntervalSince1970: storedCycle).timeIntervalSince(cycleStart)) < 1 else {
+            return nil
+        }
+        return (count, captured)
+    }
+}
+
+/// Same-cycle day load floor. Device 2026-09-18: after a 163 install bounce,
+/// widgets kept Today’s 0.7 while Home hero TRIMP reset to 0 and diagnosis
+/// reported `widget_strain_7_today_0`.
+enum AtriaHeldDayStrainFloor {
+    static let valueKey = "atria.strain.heldDayValue"
+    static let cycleKey = "atria.strain.heldDayCycleStart"
+    static let expiresKey = "atria.strain.heldDayCycleExpiresAt"
+    static let detailKey = "atria.strain.heldDayDetail"
+
+    static func persist(value: Double,
+                        cycleStart: Date,
+                        cycleExpiresAt: Date,
+                        detail: String?,
+                        now: Date = Date(),
+                        defaults: UserDefaults = .standard) {
+        guard value > 0, cycleExpiresAt > cycleStart, now < cycleExpiresAt else { return }
+        if let existing = load(cycleStart: cycleStart, now: now, defaults: defaults),
+           value + 0.05 < existing.value {
+            return
+        }
+        defaults.set(value, forKey: valueKey)
+        defaults.set(cycleStart.timeIntervalSince1970, forKey: cycleKey)
+        defaults.set(cycleExpiresAt.timeIntervalSince1970, forKey: expiresKey)
+        if let detail, !detail.isEmpty {
+            defaults.set(detail, forKey: detailKey)
+        } else {
+            defaults.removeObject(forKey: detailKey)
+        }
+    }
+
+    static func load(cycleStart: Date,
+                     now: Date = Date(),
+                     defaults: UserDefaults = .standard) -> (value: Double, detail: String?)? {
+        let value = defaults.double(forKey: valueKey)
+        guard value > 0 else { return nil }
+        let storedCycle = defaults.double(forKey: cycleKey)
+        let storedExpires = defaults.double(forKey: expiresKey)
+        guard storedCycle > 0,
+              abs(Date(timeIntervalSince1970: storedCycle).timeIntervalSince(cycleStart)) < 1,
+              storedExpires > storedCycle,
+              now.timeIntervalSince1970 < storedExpires else {
+            return nil
+        }
+        return (value, defaults.string(forKey: detailKey))
+    }
+}

@@ -1,0 +1,615 @@
+import SwiftUI
+import UIKit
+
+enum AtriaAlternateAppIcon: String, CaseIterable {
+    case primary
+    case mint
+    case graphite
+
+    var alternateName: String? {
+        switch self {
+        case .primary: return nil
+        case .mint: return "AtriaMint"
+        case .graphite: return "AtriaGraphite"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .primary: return "Classic"
+        case .mint: return "Mint"
+        case .graphite: return "Graphite"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .primary: return "app.fill"
+        case .mint: return "circle.hexagongrid.fill"
+        case .graphite: return "circle.grid.cross.fill"
+        }
+    }
+
+    static func current() -> AtriaAlternateAppIcon {
+        allCases.first { $0.alternateName == UIApplication.shared.alternateIconName } ?? .primary
+    }
+}
+
+struct AtriaCustomizeSheet: View {
+    let initialConfig: AtriaHomeLayoutConfig
+    let onCommit: (AtriaHomeLayoutConfig) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: AtriaHomeLayoutConfig
+    @State private var showResetConfirmation = false
+    @State private var selectedAppIcon: AtriaAlternateAppIcon = .primary
+    @State private var iconErrorText: String?
+    /// Shared Today-rings layout preference (also in Settings). Applied live so
+    /// the preview above updates as the wearer flips it -- a display toggle,
+    /// not part of the draft layout that Save commits.
+    @AtriaDefault(AtriaRingLayoutStyle.defaultsKey) private var ringLayoutRaw: String = "concentric"
+    private var ringLayout: AtriaRingLayoutStyle { AtriaRingLayoutStyle(rawValue: ringLayoutRaw) ?? .concentric }
+
+    init(initialConfig: AtriaHomeLayoutConfig,
+         onCommit: @escaping (AtriaHomeLayoutConfig) -> Void) {
+        self.initialConfig = initialConfig.validated()
+        self.onCommit = onCommit
+        _draft = State(initialValue: initialConfig.validated())
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    AtriaCustomizePreview(config: draft.validated())
+                        .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16))
+                }
+
+                ringsSection
+                cardsSection
+                metricsSection
+                metricToggleSection
+                cardSizeSection
+                lookSection
+                appIconSection
+                resetSection
+            }
+            .navigationTitle("Customize Today")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") {
+                        onCommit(draft.validated())
+                        dismiss()
+                    }
+                    .font(.body.weight(.semibold))
+                }
+            }
+            .confirmationDialog("Reset Today layout?",
+                                isPresented: $showResetConfirmation,
+                                titleVisibility: .visible) {
+                Button("Reset to defaults", role: .destructive) {
+                    draft = .default
+                }
+                Button("Cancel", role: .cancel) {}
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+        .onAppear {
+            selectedAppIcon = AtriaAlternateAppIcon.current()
+        }
+    }
+
+    private var ringsSection: some View {
+        Section {
+            Picker("Ring style", selection: $ringLayoutRaw) {
+                ForEach(AtriaRingLayoutStyle.allCases, id: \.self) { style in
+                    Text(style.label).tag(style.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            // The center metric exists only in the concentric layout; the
+            // separate (WHOOP-style) layout gives each ring its own
+            // value+label. `legendStatStyle` used to sit here too, but it
+            // drives the caption line on EVERY glance tile and on only the
+            // ring chips — filed under "Rings" it mispredicted its own scope,
+            // and concentric-gating hid it from separate-layout users whose
+            // tiles it still governs. It now lives with the metrics list it
+            // actually controls (2026-08-28).
+            if ringLayout == .concentric {
+                Picker("Center metric", selection: $draft.ringCenterMetric) {
+                    ForEach(AtriaHomeLayoutConfig.RingCenterMetric.allCases, id: \.self) { metric in
+                        Label(metric.label, systemImage: metric.systemImage).tag(metric)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+        } header: {
+            Text("Rings")
+        } footer: {
+            Text(ringLayout == .separate
+                 ? "Three side-by-side rings, WHOOP-style."
+                 : "Apple-Activity-style concentric rings.")
+        }
+    }
+
+    private var cardsSection: some View {
+        Section {
+            Toggle("Live strip", isOn: $draft.showLiveStrip)
+            Toggle("Weekly plan", isOn: $draft.showPlan)
+            Toggle("AI coach", isOn: $draft.showAICoach)
+        } header: {
+            Text("Cards")
+        }
+    }
+
+    private var metricsSection: some View {
+        Section {
+            ForEach(selectedMetrics) { metric in
+                metricOrderRow(metric)
+            }
+            .onMove(perform: moveSelectedMetrics)
+        } header: {
+            // Discoverability (2026-07-05): the reorder Edit control used to live
+            // only in the bottom toolbar, so users rarely found it. Co-locate it in
+            // this section's header, right beside the list it reorders.
+            HStack {
+                Text("Metric order")
+                Spacer()
+                EditButton()
+                    .textCase(nil)
+                    .font(.footnote.weight(.semibold))
+                    .accessibilityLabel("Reorder metric cards")
+            }
+        } footer: {
+            // 2026-09-02: the VoiceOver sentence told sighted readers about
+            // rotor actions VoiceOver users already find; one instruction stays.
+            Text("Tap Edit, then drag rows by the handle.")
+        }
+    }
+
+    private func metricOrderRow(_ metric: AtriaTodayMetric) -> some View {
+        Label(metric.label, systemImage: metric.systemImage)
+            // A stable domain payload supplements List's native edit handles and
+            // supports direct drop without exposing array offsets as identity.
+            .draggable(metric.dragPayload)
+            .dropDestination(for: String.self) { payloads, _ in
+                guard let payload = payloads.first,
+                      let dragged = AtriaTodayMetric.draggedMetric(from: payload),
+                      selectedMetrics.contains(dragged) else { return false }
+                withAnimation(.snappy(duration: AtriaDesignTokens.Motion.standard)) {
+                    draft.moveGlanceMetric(dragged.rawValue, before: metric.rawValue)
+                }
+                return true
+            }
+            .accessibilityAction(named: Text("Move \(metric.label) up")) {
+                draft.shiftGlanceMetric(metric.rawValue, direction: -1)
+            }
+            .accessibilityAction(named: Text("Move \(metric.label) down")) {
+                draft.shiftGlanceMetric(metric.rawValue, direction: 1)
+            }
+            .accessibilityHint("Reorders this card in Today at a glance.")
+    }
+
+    private var metricToggleSection: some View {
+        Section {
+            ForEach(AtriaTodayMetric.defaultGlanceOrder) { metric in
+                Toggle(isOn: metricBinding(metric)) {
+                    Label(metric.label, systemImage: metric.systemImage)
+                }
+                .disabled(!isSelected(metric) && draft.glanceMetrics.count >= AtriaHomeLayoutConfig.maxTodayCards)
+            }
+
+            Picker("Card caption", selection: $draft.legendStatStyle) {
+                ForEach(AtriaHomeLayoutConfig.LegendStatStyle.allCases, id: \.self) { style in
+                    Text(style.label).tag(style)
+                }
+            }
+            .pickerStyle(.segmented)
+        } header: {
+            Text("Metrics")
+        } footer: {
+            Text("Showing \(draft.glanceMetrics.count) of \(AtriaHomeLayoutConfig.maxTodayCards) Today cards.")
+        }
+    }
+
+    // Per-card resize (2026-07-05): the model always supported sizeOverrides but
+    // no UI wrote it (only a debug fixture). Offer a Wide toggle for the chart-style
+    // metrics that can actually fill a full row (canBeWideGlanceCard); single-value
+    // tiles are omitted because they'd render half-empty when stretched.
+    private var wideCapableSelectedMetrics: [AtriaTodayMetric] {
+        draft.validated().glanceMetrics
+            .compactMap(AtriaTodayMetric.init(rawValue:))
+            .filter { $0.canBeWideGlanceCard }
+    }
+
+    @ViewBuilder
+    private var cardSizeSection: some View {
+        let wideMetrics = wideCapableSelectedMetrics
+        if !wideMetrics.isEmpty {
+            Section {
+                ForEach(wideMetrics) { metric in
+                    Toggle(isOn: wideBinding(metric)) {
+                        Label(metric.label, systemImage: metric.systemImage)
+                    }
+                }
+            } header: {
+                Text("Card width")
+            } footer: {
+                Text("Chart-style cards can span the full row; other cards stay compact.")
+            }
+        }
+    }
+
+    private func wideBinding(_ metric: AtriaTodayMetric) -> Binding<Bool> {
+        Binding(
+            get: { draft.sizeOverrides[metric.rawValue] == "wide" },
+            set: { isWide in
+                if isWide {
+                    draft.sizeOverrides[metric.rawValue] = "wide"
+                } else {
+                    draft.sizeOverrides.removeValue(forKey: metric.rawValue)
+                }
+            }
+        )
+    }
+
+    private var selectedMetrics: [AtriaTodayMetric] {
+        draft.validated().glanceMetrics.compactMap(AtriaTodayMetric.init(rawValue:))
+    }
+
+    private func moveSelectedMetrics(from source: IndexSet, to destination: Int) {
+        var metrics = draft.validated().glanceMetrics
+        metrics.move(fromOffsets: source, toOffset: destination)
+        draft.glanceMetrics = metrics
+    }
+
+    private var lookSection: some View {
+        Section {
+            HStack(spacing: 12) {
+                ForEach(AtriaHomeLayoutConfig.Accent.allCases, id: \.self) { accent in
+                    Button {
+                        draft.accent = accent
+                    } label: {
+                        Circle()
+                            .fill(accent.color)
+                            .frame(width: 34, height: 34)
+                            .overlay {
+                                if draft.accent == accent {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption.weight(.black))
+                                        .foregroundStyle(.white)
+                                }
+                            }
+                            .accessibilityLabel(accent.label)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } header: {
+            Text("Look")
+        }
+    }
+
+    private var appIconSection: some View {
+        Section {
+            Picker("App icon", selection: $selectedAppIcon) {
+                ForEach(AtriaAlternateAppIcon.allCases, id: \.self) { icon in
+                    Label(icon.label, systemImage: icon.systemImage).tag(icon)
+                }
+            }
+            .pickerStyle(.inline)
+            .disabled(!UIApplication.shared.supportsAlternateIcons)
+            .onChange(of: selectedAppIcon) { _, icon in
+                applyAppIcon(icon)
+            }
+
+            if let iconErrorText {
+                Text(iconErrorText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("App icon")
+        } footer: {
+            Text(UIApplication.shared.supportsAlternateIcons
+                 ? "Changes the icon shown on the Home Screen."
+                 : "Alternate icons are unavailable on this device.")
+        }
+    }
+
+    private func applyAppIcon(_ icon: AtriaAlternateAppIcon) {
+        guard UIApplication.shared.supportsAlternateIcons else { return }
+        guard UIApplication.shared.alternateIconName != icon.alternateName else { return }
+        UIApplication.shared.setAlternateIconName(icon.alternateName) { error in
+            DispatchQueue.main.async {
+                if let error {
+                    iconErrorText = "Could not change icon: \(error.localizedDescription)"
+                    selectedAppIcon = AtriaAlternateAppIcon.current()
+                } else {
+                    iconErrorText = nil
+                }
+            }
+        }
+    }
+
+    private var resetSection: some View {
+        Section {
+            Button(role: .destructive) {
+                showResetConfirmation = true
+            } label: {
+                Label("Reset to defaults", systemImage: "arrow.counterclockwise")
+            }
+        }
+    }
+
+    private func metricBinding(_ metric: AtriaTodayMetric) -> Binding<Bool> {
+        Binding(
+            get: { isSelected(metric) },
+            set: { selected in
+                var metrics = draft.validated().glanceMetrics
+                if selected {
+                    guard !metrics.contains(metric.rawValue),
+                          metrics.count < AtriaHomeLayoutConfig.maxTodayCards else { return }
+                    metrics.append(metric.rawValue)
+                } else {
+                    metrics.removeAll { $0 == metric.rawValue }
+                }
+                draft.glanceMetrics = metrics
+            }
+        )
+    }
+
+    private func isSelected(_ metric: AtriaTodayMetric) -> Bool {
+        draft.glanceMetrics.contains(metric.rawValue)
+    }
+}
+
+private struct AtriaCustomizePreview: View {
+    let config: AtriaHomeLayoutConfig
+
+    var body: some View {
+        // The miniature is illustrative ("Example data"), scaled to 60% in
+        // a fixed frame. At large type (2026-09-02 XXXL screenshot) its
+        // stacked legend and glance grid overflowed the frame and each
+        // other; the miniature keeps a standard text size at every setting.
+        previewContent.dynamicTypeSize(.large)
+    }
+
+    private var previewContent: some View {
+        VStack(spacing: 14) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Layout preview")
+                    .font(.caption.weight(.semibold))
+
+                Spacer(minLength: 8)
+
+                Text("Example data")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            AtriaTriRing(sleep: sleepMetric,
+                         recovery: recoveryMetric,
+                         strain: strainMetric,
+                         centerValue: centerValue,
+                         centerState: centerState,
+                         // Previews the same named-center treatment the real
+                         // hero renders (2026-08-01 ring fix).
+                         centerMetricName: centerMetricName,
+                         accessibilitySummary: "Customize preview",
+                         onSleep: {},
+                         onRecovery: {},
+                         onStrain: {})
+                .scaleEffect(0.60)
+                .frame(height: 178)
+                .allowsHitTesting(false)
+
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10),
+                                GridItem(.flexible(), spacing: 10)],
+                      spacing: 10) {
+                if config.showLiveStrip {
+                    previewCard(title: "Live", value: "72", icon: "heart.fill", tint: .pink)
+                }
+                if config.showHighlights {
+                    previewCard(title: "Highlight", value: "Good", icon: "lightbulb.max.fill", tint: config.accent.color)
+                }
+                if config.showPlan {
+                    previewCard(title: "Plan", value: "2/3", icon: "checklist", tint: Metrics.electricGreen)
+                }
+                if config.showAICoach {
+                    previewCard(title: "Coach", value: "Ready", icon: "bubble.left.and.text.bubble.right.fill", tint: .cyan)
+                }
+                ForEach(config.glanceMetrics.prefix(4), id: \.self) { key in
+                    let metric = AtriaTodayMetric(rawValue: key)
+                    previewCard(title: metric?.label ?? key,
+                                value: sampleValue(for: metric),
+                                icon: metric?.systemImage ?? "square.grid.2x2",
+                                tint: tint(for: metric))
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity)
+        .atriaInsetCard(cornerRadius: AtriaDesignTokens.Radius.tile, tint: config.accent.color)
+    }
+
+    private var sleepMetric: AtriaTriRingMetric {
+        AtriaTriRingMetric(title: "Sleep",
+                           value: "7:42",
+                           detail: "Good",
+                           systemImage: "moon.fill",
+                           tint: Metrics.electricSleep,
+                           fill: 0.88)
+    }
+
+    private var recoveryMetric: AtriaTriRingMetric {
+        AtriaTriRingMetric(title: "Recovery",
+                           value: "64%",
+                           detail: "Good",
+                           systemImage: "arrow.clockwise.heart",
+                           tint: Metrics.recoveryColor(64),
+                           fill: 0.64)
+    }
+
+    private var strainMetric: AtriaTriRingMetric {
+        AtriaTriRingMetric(title: "Strain",
+                           value: "8.4",
+                           detail: "of 12",
+                           systemImage: "flame.fill",
+                           tint: Metrics.electricStrain,
+                           fill: 0.70)
+    }
+
+    private var centerValue: String {
+        switch config.ringCenterMetric {
+        case .recovery: return "64%"
+        case .sleep: return "88%"
+        case .strain: return "8.4"
+        }
+    }
+
+    private var centerState: String {
+        switch config.ringCenterMetric {
+        case .recovery, .sleep: return "Good"
+        case .strain: return "Build"
+        }
+    }
+
+    private var centerMetricName: String {
+        switch config.ringCenterMetric {
+        case .recovery: return AtriaTriRingSlot.recovery.label
+        case .sleep: return AtriaTriRingSlot.sleep.label
+        case .strain: return AtriaTriRingSlot.strain.label
+        }
+    }
+
+    private func previewCard(title: String, value: String, icon: String, tint: Color) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(tint)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                Text(value)
+                    .font(.subheadline.weight(.bold))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(minHeight: 56)
+        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func sampleValue(for metric: AtriaTodayMetric?) -> String {
+        switch metric {
+        case .recovery: return "64%"
+        case .strain: return "8.4"
+        case .load: return "0.9"
+        case .hrZones: return "47m"
+        case .workouts: return "3"
+        case .strainCompare: return "4.2"
+        case .hrv: return "48 ms"
+        case .stress: return "Low"
+        case .sleep: return "7:42"
+        case .sleepHistory: return "5/7"
+        case .sleepEfficiency: return "91%"
+        case .sleepPerformance: return "88%"
+        case .rhr: return "58"
+        case .respiratoryRate: return "14.2"
+        case .steps: return "8.2k"
+        case .calories: return "520"
+        case .vo2max: return "42"
+        case .bioAge: return "31"
+        case .bloodOxygen, .bodyTemp: return "--"
+        case .trend: return "Steady"
+        case .insights: return "2"
+        case nil: return "On"
+        }
+    }
+
+    private func tint(for metric: AtriaTodayMetric?) -> Color {
+        switch metric {
+        case .recovery: return Metrics.recoveryColor(64)
+        case .strain, .load, .calories, .strainCompare: return Metrics.electricStrain
+        case .sleep, .sleepHistory, .sleepEfficiency, .sleepPerformance: return Metrics.electricSleep
+        // One identity hue per metric (design palette, adaptive on light) —
+        // was: HRV/RHR/respiration/SpO2 all `.pink` and stress `.cyan`, which
+        // clashed with the canonical AtriaMetricDetailKind.tint mapping.
+        case .hrv: return Metrics.electricHRV
+        case .rhr, .bloodOxygen: return Metrics.electricRHR
+        case .respiratoryRate: return Metrics.electricRespiratory
+        case .stress: return Metrics.electricStress
+        case .steps, .vo2max, .bioAge: return Metrics.electricGreen
+        case .bodyTemp: return Metrics.electricRespiratory
+        case .hrZones: return Metrics.electricStrain
+        case .workouts: return .mint
+        case .trend, .insights, nil: return config.accent.color
+        }
+    }
+}
+
+private extension AtriaHomeLayoutConfig.RingCenterMetric {
+    var label: String {
+        switch self {
+        case .recovery: return "Recovery"
+        case .sleep: return "Sleep"
+        case .strain: return "Strain"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .recovery: return "arrow.clockwise.heart"
+        case .sleep: return "moon.fill"
+        case .strain: return "flame.fill"
+        }
+    }
+}
+
+private extension AtriaHomeLayoutConfig.LegendStatStyle {
+    var label: String {
+        switch self {
+        case .value: return "Value"
+        case .valueAndState: return "State"
+        }
+    }
+}
+
+extension AtriaHomeLayoutConfig.Accent {
+    var label: String {
+        switch self {
+        case .atria: return "Atria"
+        case .mint: return "Mint"
+        case .cyan: return "Cyan"
+        case .coral: return "Coral"
+        case .violet: return "Violet"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .atria: return Metrics.electricGreen
+        case .mint: return Color(red: 0.25, green: 0.82, blue: 0.64)
+        case .cyan: return Color(red: 0.16, green: 0.68, blue: 0.95)
+        case .coral: return Color(red: 1.0, green: 0.42, blue: 0.36)
+        case .violet: return Metrics.electricSleep
+        }
+    }
+}

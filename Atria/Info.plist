@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.adidshaft.atria.refresh</string>
+		<string>com.adidshaft.atria.processing</string>
+	</array>
+	<key>CFBundleDisplayName</key>
+	<string>Atria</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundleAlternateIcons</key>
+		<dict>
+			<key>AtriaGraphite</key>
+			<dict>
+				<key>CFBundleIconFiles</key>
+				<array>
+					<string>AtriaIconGraphite</string>
+				</array>
+				<key>UIPrerenderedIcon</key>
+				<true/>
+			</dict>
+			<key>AtriaMint</key>
+			<dict>
+				<key>CFBundleIconFiles</key>
+				<array>
+					<string>AtriaIconMint</string>
+				</array>
+				<key>UIPrerenderedIcon</key>
+				<true/>
+			</dict>
+		</dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>CFBundleName</key>
+	<string>Atria</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.adidshaft.atria</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>atria</string>
+			</array>
+		</dict>
+	</array>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>whoop</string>
+	</array>
+	<key>NSAlarmKitUsageDescription</key>
+	<string>Atria uses alarms only when you choose a wake time, so the phone can reliably alert you by that time even if the app is not open.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Atria can use the camera only when you choose to place a photo behind a share card.</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>Atria reads Health only to confirm locally captured Atria data appears in Apple Health and, when you enable it, to use nutrition samples from your food app as recovery context.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>This app writes local heart-rate sessions, workouts, and user-confirmed sleep to Apple Health when you explicitly enable export.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Atria keeps a Bluetooth connection to your strap so heart-rate and motion can continue while the app is in the background.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Atria records your route, distance, pace, and elevation only while an outdoor workout is active, including when the screen is locked.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Atria records your route, distance, pace, and elevation only while you run, walk, hike, or cycle with an active workout.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>Atria uses on-device motion context to avoid mistaking driving for a workout and to suggest walking, running, or cycling when the evidence is sustained.</string>
+	<key>NSLocationTemporaryUsageDescriptionDictionary</key>
+	<dict>
+		<key>AtriaWorkoutRoute</key>
+		<string>Precise Location keeps your active workout route, distance, pace, and elevation accurate while the screen is locked or you use another app.</string>
+	</dict>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Atria can read the photo you choose only to place it behind a share card.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
+	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+		<string>bluetooth-peripheral</string>
+		<string>fetch</string>
+		<string>processing</string>
+		<string>location</string>
+	</array>
+</dict>
+</plist>

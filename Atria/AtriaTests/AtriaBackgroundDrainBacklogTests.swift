@@ -1,0 +1,321 @@
+import XCTest
+@testable import Atria
+
+/// Truth table for `AtriaBLEManager.drainableStrapBacklogPendingFromDefaults` —
+/// the robust backlog signal the wake-driven lanes now use instead of the raw
+/// `rangeLossBackfillPending` ticket (2026-08-08 background-stall fix). The
+/// ticket can be falsely cleared by publication while records remain on the
+/// strap; this predicate also catches fresh non-caught-up flush debt and a
+/// >= 30-min-stale drain frontier.
+final class AtriaBackgroundDrainBacklogTests: XCTestCase {
+    private let ticketKey = "atria.offlineSync.rangeLossBackfillPending"
+    private let debtObservedKey = "atria.offlineSync.flushDebtObservedAt.v1"
+    private let debtRecordsKey = "atria.offlineSync.flushDebtPendingRecords.v1"
+    private let frontierKey = "atria.offlineSync.drainedThroughUnix.v1"
+
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func makeSuite() throws -> (UserDefaults, String) {
+        let name = "atria.drainbacklog.test.\(UUID().uuidString)"
+        return (try XCTUnwrap(UserDefaults(suiteName: name)), name)
+    }
+
+    private func pending(_ s: UserDefaults) -> Bool {
+        AtriaBLEManager.drainableStrapBacklogPendingFromDefaults(now: now, defaults: s)
+    }
+
+    func testTicketAloneIsBacklog() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(true, forKey: ticketKey)
+        XCTAssertTrue(pending(s))
+    }
+
+    func testFreshNonCaughtUpDebtIsBacklog_theObservedIncidentState() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 5 * 60, forKey: debtObservedKey) // fresh
+        s.set(267, forKey: debtRecordsKey)                                 // > 120 floor
+        XCTAssertTrue(pending(s), "267 pending, fresh, no ticket -> backlog (the observed stall)")
+    }
+
+    func testFreshCaughtUpDebtIsNotBacklog() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 5 * 60, forKey: debtObservedKey)
+        s.set(100, forKey: debtRecordsKey) // <= 120 floor -> caught up
+        XCTAssertFalse(pending(s))
+    }
+
+    func testFreshCaughtUpDebtOutranksStaleFrontierUntilObservationExpires() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 5 * 60, forKey: debtObservedKey)
+        s.set(100, forKey: debtRecordsKey)
+        s.set(now.timeIntervalSince1970 - 8 * 60 * 60, forKey: frontierKey)
+
+        XCTAssertEqual(reason(s), .none,
+                       "fresh verified caught-up debt must suppress the stale phone-frontier fallback")
+        XCTAssertFalse(pending(s),
+                       "a caught-up 0x22 response must not re-arm raw catch-up every retry interval")
+
+        s.set(now.timeIntervalSince1970 - 16 * 60, forKey: debtObservedKey)
+        XCTAssertEqual(reason(s), .frontierStale,
+                       "after the observation expires, one stale-frontier probe may refresh strap truth")
+        XCTAssertTrue(pending(s))
+    }
+
+    func testTicketStillOutranksFreshCaughtUpDebtAndStaleFrontier() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(true, forKey: ticketKey)
+        s.set(now.timeIntervalSince1970 - 5 * 60, forKey: debtObservedKey)
+        s.set(100, forKey: debtRecordsKey)
+        s.set(now.timeIntervalSince1970 - 8 * 60 * 60, forKey: frontierKey)
+
+        XCTAssertEqual(reason(s), .ticket)
+        XCTAssertTrue(pending(s))
+    }
+
+    func testStaleFrontierIsBacklog() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 40 * 60, forKey: frontierKey) // 40 min behind
+        XCTAssertTrue(pending(s), "frontier >= 30 min stale -> backlog")
+    }
+
+    func testFreshFrontierIsNotBacklog() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 20 * 60, forKey: frontierKey) // 20 min behind
+        XCTAssertFalse(pending(s), "frontier < 30 min -> not backlog")
+    }
+
+    func testStaleDebtIsIgnoredAndFallsToFrontier() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 20 * 60, forKey: debtObservedKey) // STALE (> 15 min)
+        s.set(267, forKey: debtRecordsKey)                                  // would be backlog if fresh
+        s.set(now.timeIntervalSince1970 - 20 * 60, forKey: frontierKey)     // frontier only 20 min
+        XCTAssertFalse(pending(s), "stale debt is ignored; fresh-enough frontier -> not backlog")
+    }
+
+    func testEmptyStateIsNotBacklog() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        XCTAssertFalse(pending(s), "no ticket, no debt, no frontier -> not backlog")
+    }
+
+    // MARK: - strapBacklogReason (drives the HR->motion yield, 2026-08-08)
+    // The HR autonomous catch-up lane yields the shared transport to a waiting
+    // motion offload ONLY when the reason is `.frontierStale` (soft). A `.ticket`
+    // or `.freshDebt` (hard) must never yield — latest-data reliability wins.
+
+    private func reason(_ s: UserDefaults) -> AtriaBLEManager.StrapBacklogReason {
+        AtriaBLEManager.strapBacklogReason(now: now, defaults: s)
+    }
+
+    func testReasonTicketIsHardAndNeverYields() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(true, forKey: ticketKey)
+        XCTAssertEqual(reason(s), .ticket)
+    }
+
+    func testReasonFreshDebtIsHardAndNeverYields() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 5 * 60, forKey: debtObservedKey)
+        s.set(267, forKey: debtRecordsKey)
+        XCTAssertEqual(reason(s), .freshDebt)
+    }
+
+    func testReasonFrontierStaleIsSoftAndYields() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 40 * 60, forKey: frontierKey)
+        XCTAssertEqual(reason(s), .frontierStale,
+                       "soft-behind frontier is the only reason that yields to motion")
+    }
+
+    func testReasonNoneWhenCaughtUp() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        XCTAssertEqual(reason(s), .none)
+    }
+
+    func testTicketOutranksStaleFrontier_staysHard() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(true, forKey: ticketKey)
+        s.set(now.timeIntervalSince1970 - 40 * 60, forKey: frontierKey) // also stale
+        XCTAssertEqual(reason(s), .ticket, "a real ticket must win over a stale frontier -> no yield")
+    }
+
+    // MARK: - Connected-slice HOLD signal parity (2026-08-08 bg-convergence fix)
+    // The drain HOLD (keep a productive background slice through live-HR silence
+    // instead of releasing it into a 5-min cooldown) must key on the SAME robust
+    // backlog signal as admission — not the raw range-loss ticket, which the
+    // publication race can clear while records still sit on the strap.
+
+    private func hold(backlog: Bool,
+                      foreground: Bool = false,
+                      owner: AtriaBLEManager.ProtectedR10CleanOwnerState = .none,
+                      workout: Bool = false,
+                      storm: Bool = false,
+                      productive: Bool = true) -> Bool {
+        AtriaBLEManager.shouldHoldProductiveBacklogSlice(
+            backlogPending: backlog,
+            foregroundInteractive: foreground,
+            cleanOwnerState: owner,
+            activeExplicitWorkout: workout,
+            recentDisconnectStorm: storm,
+            recentDurableProgress: productive)
+    }
+
+    func testHoldEngagesForBackgroundProductiveBacklog() {
+        XCTAssertTrue(hold(backlog: true))
+    }
+
+    func testHoldNeverEngagesInForeground() {
+        XCTAssertFalse(hold(backlog: true, foreground: true),
+                       "live HR wins in the foreground; never hold a slice there")
+    }
+
+    func testStalledSliceIsReleasedNotHeld() {
+        XCTAssertFalse(hold(backlog: true, productive: false),
+                       "no recent durable progress -> release, never hold a dead slice")
+    }
+
+    func testNoBacklogNoHold() {
+        XCTAssertFalse(hold(backlog: false))
+    }
+
+    func testWorkoutOrStormBlocksHold() {
+        XCTAssertFalse(hold(backlog: true, workout: true))
+        XCTAssertFalse(hold(backlog: true, storm: true))
+    }
+
+    func testUnprovenOwnerStateBlocksHold() {
+        XCTAssertFalse(hold(backlog: true, owner: .proving))
+    }
+
+    /// THE FIX: a frontier-stale backlog (no raw ticket, no fresh debt) now
+    /// engages the hold because it reads the robust signal. Under the old
+    /// raw-ticket gate this returned false and the background drain stalled.
+    func testFrontierStaleBacklogEngagesHoldViaRobustSignal() throws {
+        let (s, n) = try makeSuite(); defer { s.removePersistentDomain(forName: n) }
+        s.set(now.timeIntervalSince1970 - 40 * 60, forKey: frontierKey) // 40 min stale, NO ticket
+        XCTAssertFalse(s.bool(forKey: ticketKey), "precondition: the raw range-loss ticket is clear")
+        let backlog = AtriaBLEManager.drainableStrapBacklogPendingFromDefaults(now: now, defaults: s)
+        XCTAssertTrue(backlog, "robust signal recognizes the frontier-stale backlog")
+        XCTAssertTrue(hold(backlog: backlog),
+                      "hold engages on robust backlog even with the raw ticket clear (the bug's target case)")
+    }
+
+    // MARK: - Strap-recharge flush trigger (user directive 2026-08-22)
+
+    private func rechargeFlush(_ previous: Int, _ new: Int) -> Bool {
+        AtriaBLEManager.strapRechargeIndicatesFlushOpportunity(
+            previousLevel: previous,
+            newLevel: new
+        )
+    }
+
+    func testLargeBatteryRiseLooksLikeRechargeAndFlushes() {
+        // The observed incident: charged hours ago, reconnects at a high level.
+        XCTAssertTrue(rechargeFlush(18, 92))
+        XCTAssertTrue(rechargeFlush(40, 100))
+    }
+
+    func testGentleConnectedChargeDoesNotTripRecharge() {
+        // A connected charge climbs one point per accepted read; never a jump.
+        XCTAssertFalse(rechargeFlush(61, 62))
+        XCTAssertFalse(rechargeFlush(80, 88), "below the +15 recharge floor")
+    }
+
+    func testRechargeFloorIsExactlyFifteen() {
+        XCTAssertTrue(rechargeFlush(50, 65), "a +15 rise qualifies")
+        XCTAssertFalse(rechargeFlush(50, 64), "a +14 rise does not")
+    }
+
+    func testDeclineOrUnknownBaselineNeverFlushes() {
+        XCTAssertFalse(rechargeFlush(90, 40), "a decline is not a recharge")
+        XCTAssertFalse(rechargeFlush(-1, 95), "no prior baseline cannot prove a recharge")
+        XCTAssertFalse(rechargeFlush(50, 130), "an implausible >100 level is rejected")
+    }
+
+    // MARK: - Foreground + charging fast catch-up gate (user directive 2026-08-22)
+
+    private func fast(
+        foreground: Bool,
+        charging: Bool,
+        thermal: ProcessInfo.ThermalState
+    ) -> Bool {
+        AtriaBLEManager.shouldUseForegroundChargingFastCatchUp(
+            foregroundInteractive: foreground,
+            phoneCharging: charging,
+            thermalState: thermal
+        )
+    }
+
+    func testFastCatchUpRequiresForegroundChargingAndCoolEnough() {
+        XCTAssertTrue(fast(foreground: true, charging: true, thermal: .nominal))
+        XCTAssertTrue(fast(foreground: true, charging: true, thermal: .fair))
+    }
+
+    func testFastCatchUpBlockedWhenNotForegroundOrNotCharging() {
+        XCTAssertFalse(fast(foreground: false, charging: true, thermal: .nominal),
+                       "background keeps the gentle cadence (CPU budget)")
+        XCTAssertFalse(fast(foreground: true, charging: false, thermal: .nominal),
+                       "off charger keeps the gentle cadence (battery)")
+    }
+
+    func testFastCatchUpBlockedWhenThermallyStressed() {
+        XCTAssertFalse(fast(foreground: true, charging: true, thermal: .serious))
+        XCTAssertFalse(fast(foreground: true, charging: true, thermal: .critical))
+    }
+
+    // MARK: - Higher-cadence catch-up boost (user directive 2026-08-22)
+
+    func testCatchUpBoostTightensCadenceToCoverage() {
+        // Without the boost, the saved profile's cadence is used verbatim.
+        XCTAssertEqual(
+            AtriaBLEManager.effectiveLongWearCadenceMultiplier(
+                profileMultiplier: 1.0, catchUpBoostActive: false),
+            1.0, accuracy: 0.0001)
+        // With the boost, Balanced (1.0) and Saver (1.75) both tighten to
+        // Coverage (0.75); an already-tight profile is left alone.
+        XCTAssertEqual(
+            AtriaBLEManager.effectiveLongWearCadenceMultiplier(
+                profileMultiplier: 1.0, catchUpBoostActive: true),
+            0.75, accuracy: 0.0001)
+        XCTAssertEqual(
+            AtriaBLEManager.effectiveLongWearCadenceMultiplier(
+                profileMultiplier: 1.75, catchUpBoostActive: true),
+            0.75, accuracy: 0.0001)
+        XCTAssertEqual(
+            AtriaBLEManager.effectiveLongWearCadenceMultiplier(
+                profileMultiplier: 0.75, catchUpBoostActive: true),
+            0.75, accuracy: 0.0001)
+    }
+
+    func testCatchUpBoostTightensStaleTimeoutToCoverage() {
+        XCTAssertEqual(
+            AtriaBLEManager.effectiveLongWearStaleTimeoutMultiplier(
+                profileMultiplier: 1.0, catchUpBoostActive: false),
+            1.0, accuracy: 0.0001)
+        XCTAssertEqual(
+            AtriaBLEManager.effectiveLongWearStaleTimeoutMultiplier(
+                profileMultiplier: 1.4, catchUpBoostActive: true),
+            0.85, accuracy: 0.0001)
+        XCTAssertEqual(
+            AtriaBLEManager.effectiveLongWearStaleTimeoutMultiplier(
+                profileMultiplier: 0.85, catchUpBoostActive: true),
+            0.85, accuracy: 0.0001)
+    }
+
+    // MARK: - Profile → radio-mode coupling (user directive 2026-08-22)
+
+    func testCoverageProfileCouplesToFullProtocol() {
+        // false == full protocol (motion streams live → current steps).
+        XCTAssertEqual(
+            AtriaBLEManager.standardHROnlyRadioForCollectionProfile(.maxCoverage), false)
+    }
+
+    func testSaverProfileCouplesToHROnlyRadio() {
+        XCTAssertEqual(
+            AtriaBLEManager.standardHROnlyRadioForCollectionProfile(.batterySaver), true)
+    }
+
+    func testBalancedProfileLeavesRadioUntouched() {
+        XCTAssertNil(
+            AtriaBLEManager.standardHROnlyRadioForCollectionProfile(.balanced))
+    }
+}

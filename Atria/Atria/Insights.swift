@@ -1,0 +1,775 @@
+import SwiftUI
+import Charts
+
+/// A personal baseline that LEARNS over time. After each saved session we fold
+/// its stable resting HR into an exponential moving average, so "your normal"
+/// adapts to you instead of being a fixed guess. Persisted in UserDefaults.
+struct PersonalBaseline: Codable {
+    /// Version 1 means every HRV-bearing sample was admitted only from
+    /// qualified standard 2A37 RR inside a confirmed main-sleep window.
+    /// Older persisted baselines used a clock-only "overnight" heuristic and
+    /// must fail closed until SessionStore rebuilds them from durable evidence.
+    /// Version 2 qualifies five-minute windows over valid adjacent-beat PAIRS
+    /// (differences never straddle a >3 s dropout) instead of demanding a
+    /// fully gap-free window, so version-1 window counts and RMSSDs are not
+    /// comparable and every persisted HRV must be recomputed from raw RR.
+    static let currentHRVQualificationVersion = 2
+
+    var restingHR: Double?      // learned resting baseline (EMA)
+    var hrvEMA: Double?         // learned HRV baseline (EMA, ms)
+    var sessions: Int = 0
+    var updated: Date?
+    var samples: [BaselineSample] = []
+    var hrvQualificationVersion: Int = Self.currentHRVQualificationVersion
+
+    private static let alpha = 0.1    // weight on the newest session
+    /// One anomalous night must not yank "your normal": per-sample EMA movement
+    /// is bounded in addition to the alpha weighting.
+    private static let maxRestingStepBPM = 2.0
+    private static let maxHRVStepMS = 6.0
+    private static let maxSamples = 90
+    static let trustedMinimumSamples = 14
+    static let staleAfter: TimeInterval = 21 * 24 * 60 * 60
+    /// Recovery keeps a slightly longer historical comparator than the live
+    /// stress and target surfaces.  It still requires the same recent 21-day
+    /// evidence to be eligible, but the comparison itself can see a complete
+    /// 30-day physiological cycle.  This is deliberately recovery-specific:
+    /// changing `freshSamples` would silently alter unrelated live metrics.
+    static let recoveryComparisonHorizonDays = 30
+    static let recoveryRecentQualificationHorizonDays = 21
+    /// Once this many fresh OVERNIGHT HRV samples exist, the lnRMSSD baseline is
+    /// computed from overnight samples only (WHOOP-like sleep-window HRV). Below it,
+    /// we fall back to all samples so an intermittent overnight stream never starves
+    /// the baseline.
+    static let overnightHRVPreferenceMinimum = 7
+
+    struct BaselineSample: Codable {
+        let date: Date
+        let restingHR: Double
+        let rmssd: Double?
+        /// Version-1 semantics: true only when this sample's qualified standard
+        /// 2A37 RR came from inside a confirmed main-sleep window. The optional
+        /// representation keeps old payloads decodable, but version-0 values are
+        /// never trusted as confirmed-sleep evidence.
+        var overnight: Bool?
+
+        var lnRMSSD: Double? {
+            guard let rmssd, rmssd > 0 else { return nil }
+            return log(rmssd)
+        }
+
+        var isOvernightSample: Bool { overnight == true }
+    }
+
+    /// A frozen, auditable candidate comparator for a future, externally
+    /// validated Recovery model.  The current displayed Recovery v2 score does
+    /// not consume this yet; recording it beside v2 lets validation compare the
+    /// candidate with eventual user-confirmed outcomes without rewriting history.
+    struct RecoveryComparison: Equatable {
+        struct Statistic: Equatable {
+            /// Median rather than a mean. The explicit `statistic` field in a
+            /// receipt prevents this location from being mistaken for v2's
+            /// ordinary mean.
+            let location: Double
+            /// MAD scaled to a normal-distribution SD equivalent.
+            let scale: Double
+            let sampleCount: Int
+        }
+
+        let asOf: Date
+        let comparisonHorizonDays: Int
+        let recentQualificationHorizonDays: Int
+        let statistic: String
+        let restingHeartRate: Statistic?
+        let hrv: Statistic?
+        let recentQualifiedRestingDays: Int
+        let recentQualifiedHRVNights: Int
+        let restingTrusted: Bool
+        let hrvTrusted: Bool
+    }
+
+    init(restingHR: Double? = nil, hrvEMA: Double? = nil, sessions: Int = 0,
+         updated: Date? = nil, samples: [BaselineSample] = [],
+         hrvQualificationVersion: Int = Self.currentHRVQualificationVersion) {
+        self.restingHR = restingHR
+        self.hrvEMA = hrvEMA
+        self.sessions = sessions
+        self.updated = updated
+        self.samples = samples
+        self.hrvQualificationVersion = hrvQualificationVersion
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case restingHR, hrvEMA, sessions, updated, samples, hrvQualificationVersion
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        restingHR = try c.decodeIfPresent(Double.self, forKey: .restingHR)
+        let decodedQualificationVersion = try c.decodeIfPresent(Int.self,
+                                                                 forKey: .hrvQualificationVersion) ?? 0
+        hrvQualificationVersion = decodedQualificationVersion
+        hrvEMA = decodedQualificationVersion >= Self.currentHRVQualificationVersion
+            ? try c.decodeIfPresent(Double.self, forKey: .hrvEMA)
+            : nil
+        sessions = try c.decodeIfPresent(Int.self, forKey: .sessions) ?? 0
+        updated = try c.decodeIfPresent(Date.self, forKey: .updated)
+        let decodedSamples = try c.decodeIfPresent([BaselineSample].self, forKey: .samples) ?? []
+        if decodedQualificationVersion >= Self.currentHRVQualificationVersion {
+            samples = decodedSamples
+        } else {
+            // Retain trustworthy resting-HR history, but strip HRV whose old
+            // clock-only provenance cannot prove confirmed main sleep.
+            samples = decodedSamples.map {
+                BaselineSample(date: $0.date,
+                               restingHR: $0.restingHR,
+                               rmssd: nil,
+                               overnight: false)
+            }
+        }
+    }
+
+    mutating func learn(fromResting resting: Int, hrv: Int, at observedAt: Date = Date(), overnight: Bool = false) {
+        sessions += 1
+        updated = observedAt
+        if resting > 0 {
+            samples.append(BaselineSample(date: observedAt,
+                                          restingHR: Double(resting),
+                                          rmssd: hrv > 0 ? Double(hrv) : nil,
+                                          overnight: overnight))
+            // Reconnects and segmented saves can produce several qualified
+            // windows on one civil day. A personal baseline is a day-level
+            // signal, so those fragments must not receive extra statistical or
+            // EMA weight. Confirmed-sleep evidence wins over daytime evidence;
+            // within one evidence class the lowest qualified resting window is
+            // the canonical observation.
+            samples = Self.canonicalDailySamples(samples)
+            if samples.count > Self.maxSamples {
+                samples.removeFirst(samples.count - Self.maxSamples)
+            }
+            rebuildLearnedValuesFromCanonicalSamples()
+        } else if hrv > 0 {
+            // HRV without a paired qualified resting observation has no durable
+            // day anchor and must not silently bias the baseline.
+            hrvEMA = Self.ema(values: samples.compactMap(\.rmssd),
+                              maximumStep: Self.maxHRVStepMS)
+        }
+    }
+
+    /// A confirmed main sleep is the durable day-level authority for its
+    /// overnight RHR/HRV. Merge it idempotently so retained confirmed nights
+    /// can fill baseline days after raw-session retirement or app relaunch.
+    @discardableResult
+    mutating func mergeConfirmedSleep(
+        resting: Int,
+        hrv: Int?,
+        at observedAt: Date,
+        calendar: Calendar = .current
+    ) -> Bool {
+        guard (35...240).contains(resting) else { return false }
+        let qualifiedHRV = hrv.flatMap { $0 > 0 ? Double($0) : nil }
+        let day = calendar.startOfDay(for: observedAt)
+        let existing = samples.first {
+            calendar.isDate($0.date, inSameDayAs: day)
+        }
+        // A nil confirmed-sleep HRV means "not available from this compact
+        // record", not proof that already-qualified raw RR for the same night
+        // was invalid. Preserve that stronger same-day overnight evidence.
+        let resolvedHRV = qualifiedHRV
+            ?? existing.flatMap { $0.isOvernightSample ? $0.rmssd : nil }
+        if let existing,
+           existing.isOvernightSample,
+           Int(existing.restingHR.rounded()) == resting,
+           existing.rmssd == resolvedHRV {
+            return false
+        }
+
+        let insertedNewDay = existing == nil
+        samples.removeAll {
+            calendar.isDate($0.date, inSameDayAs: day)
+        }
+        samples.append(BaselineSample(date: observedAt,
+                                      restingHR: Double(resting),
+                                      rmssd: resolvedHRV,
+                                      overnight: true))
+        samples = Self.canonicalDailySamples(samples, calendar: calendar)
+        if samples.count > Self.maxSamples {
+            samples.removeFirst(samples.count - Self.maxSamples)
+        }
+        if insertedNewDay {
+            sessions += 1
+        }
+        updated = max(updated ?? observedAt, observedAt)
+        hrvQualificationVersion = Self.currentHRVQualificationVersion
+        rebuildLearnedValuesFromCanonicalSamples()
+        return true
+    }
+
+    var restingInt: Int? { restingHR.map { Int($0.rounded()) } }
+    var hrvInt: Int? {
+        guard hrvQualificationVersion >= Self.currentHRVQualificationVersion else { return nil }
+        return hrvEMA.map { Int($0.rounded()) }
+    }
+    var hrvSampleCount: Int {
+        guard hrvQualificationVersion >= Self.currentHRVQualificationVersion else { return 0 }
+        return Self.canonicalDailySamples(samples).compactMap(\.lnRMSSD).count
+    }
+    var restingSampleCount: Int { Self.canonicalDailySamples(samples).count }
+
+    func freshSamples(now: Date = Date()) -> [BaselineSample] {
+        Self.canonicalDailySamples(samples).filter { sample in
+            let age = now.timeIntervalSince(sample.date)
+            return age >= 0 && age <= Self.staleAfter
+        }
+    }
+
+    // Trust counts distinct DAYS, not raw samples: several sessions in one day
+    // must not fast-track a "trusted" baseline.
+    func freshRestingSampleCount(now: Date = Date()) -> Int {
+        Self.distinctDayCount(freshSamples(now: now))
+    }
+
+    func freshHRVSampleCount(now: Date = Date()) -> Int {
+        guard hrvQualificationVersion >= Self.currentHRVQualificationVersion else { return 0 }
+        return Self.distinctDayCount(freshSamples(now: now).filter {
+            $0.lnRMSSD != nil && $0.isOvernightSample
+        })
+    }
+
+    private static func distinctDayCount(_ samples: [BaselineSample],
+                                         calendar: Calendar = .current) -> Int {
+        Set(samples.map { calendar.startOfDay(for: $0.date) }).count
+    }
+
+    static func canonicalDailySamples(
+        _ samples: [BaselineSample],
+        calendar: Calendar = .current
+    ) -> [BaselineSample] {
+        var byDay: [Date: BaselineSample] = [:]
+        for sample in samples.sorted(by: { $0.date < $1.date }) {
+            let day = calendar.startOfDay(for: sample.date)
+            guard let existing = byDay[day] else {
+                byDay[day] = sample
+                continue
+            }
+            let existingPriority = existing.isOvernightSample ? 1 : 0
+            let incomingPriority = sample.isOvernightSample ? 1 : 0
+            if incomingPriority > existingPriority
+                || (incomingPriority == existingPriority
+                    && sample.restingHR < existing.restingHR) {
+                byDay[day] = sample
+            }
+        }
+        return byDay.values.sorted { $0.date < $1.date }
+    }
+
+    /// Fresh HRV samples that came from an overnight/sleep window.
+    func freshOvernightHRVSampleCount(now: Date = Date()) -> Int {
+        guard hrvQualificationVersion >= Self.currentHRVQualificationVersion else { return 0 }
+        return freshSamples(now: now).filter { $0.isOvernightSample }.compactMap(\.lnRMSSD).count
+    }
+
+    func isStale(now: Date = Date()) -> Bool {
+        guard let updated else { return true }
+        return now.timeIntervalSince(updated) > Self.staleAfter
+    }
+
+    func hasTrustedRestingBaseline(now: Date = Date()) -> Bool {
+        freshRestingSampleCount(now: now) >= Self.trustedMinimumSamples && !isStale(now: now)
+    }
+
+    /// A deliberately narrow bridge for high-specificity, fragmented main
+    /// sleep only. Requiring 14 *fresh* days can strand a physiologically
+    /// unambiguous night at review when the learned baseline has 13 qualified
+    /// days, is current, and still has a meaningful recent cohort, merely
+    /// because one or two older observations crossed the hard 21-day edge.
+    /// This does not make the baseline trusted for recovery, stress, or any
+    /// other metric; it only supplies enough personal resting provenance for
+    /// the stricter multi-fragment HR-only sleep gate.
+    func hasNearTrustedRestingBaselineForFragmentedSleep(now: Date = Date()) -> Bool {
+        let totalQualifiedDays = Self.distinctDayCount(Self.canonicalDailySamples(samples))
+        let freshQualifiedDays = freshRestingSampleCount(now: now)
+        return totalQualifiedDays >= Self.trustedMinimumSamples - 1
+            && freshQualifiedDays >= Self.overnightHRVPreferenceMinimum
+            && !isStale(now: now)
+    }
+
+    func hasTrustedHRVBaseline(now: Date = Date()) -> Bool {
+        freshHRVSampleCount(now: now) >= Self.trustedMinimumSamples && !isStale(now: now)
+    }
+
+    /// Display-ready maturity qualifier for the resting baseline, e.g.
+    /// "Learning · 5 of 14 days". `nil` once the baseline is trusted.
+    ///
+    /// Resting HR can learn from a qualified daytime low-HR window, so the
+    /// maturity unit is days. HRV remains explicitly sleep-window qualified.
+    ///
+    /// Deliberately mirrors `AtriaFitnessAge`'s "Early estimate · day N of M":
+    /// a value is shown from the first day and the qualifier discloses how far
+    /// the baseline has matured, rather than withholding the reading until it
+    /// is confident. Withholding is not more honest — it just leaves the wearer
+    /// with nothing while the app silently waits.
+    ///
+    /// This is the ONE place the maturity state should be read from, so the
+    /// caveat can be surfaced in a single location instead of being repeated
+    /// against every derived number.
+    func restingBaselineMaturityQualifierText(now: Date = Date()) -> String? {
+        guard !hasTrustedRestingBaseline(now: now) else { return nil }
+        let days = min(freshRestingSampleCount(now: now), Self.trustedMinimumSamples)
+        // Named like its rotating siblings ("HRV calibrating · …", "VO₂ max
+        // estimating · …") — subject-less "Learning" at the top of Today read
+        // as the whole app being uncalibrated (2026-08-04 review, rank 5).
+        return "Resting HR learning · \(days) of \(Self.trustedMinimumSamples) days"
+    }
+
+    /// Display-ready maturity qualifier for the HRV baseline, e.g.
+    /// "HRV calibrating · 2 of 14 nights". `nil` once trusted. Same show-the-
+    /// value-and-disclose philosophy as the resting qualifier above; nights,
+    /// not days, because HRV qualification is sleep-window-only.
+    func hrvBaselineMaturityQualifierText(now: Date = Date()) -> String? {
+        guard !hasTrustedHRVBaseline(now: now) else { return nil }
+        let nights = min(freshHRVSampleCount(now: now), Self.trustedMinimumSamples)
+        return "HRV calibrating · \(nights) of \(Self.trustedMinimumSamples) nights"
+    }
+
+    var restingStats: (mean: Double, sd: Double, count: Int)? {
+        restingStats(now: Date())
+    }
+
+    /// Testable variant with an explicit `now` — mirrors lnRMSSDStats(now:) so
+    /// callers that inject a clock (stress scoring, tests) stay deterministic.
+    func restingStats(now: Date) -> (mean: Double, sd: Double, count: Int)? {
+        stats(freshSamples(now: now).map(\.restingHR))
+    }
+
+    /// HRV baseline stats, preferring overnight/sleep-window samples (like WHOOP's
+    /// sleep-weighted HRV) once enough exist; otherwise falls back to all fresh
+    /// samples so an intermittent overnight stream never blocks the baseline.
+    var lnRMSSDStats: (mean: Double, sd: Double, count: Int)? {
+        lnRMSSDStats(now: Date())
+    }
+
+    /// Testable variant with an explicit `now` for deterministic calibration.
+    func lnRMSSDStats(now: Date) -> (mean: Double, sd: Double, count: Int)? {
+        guard hrvQualificationVersion >= Self.currentHRVQualificationVersion else { return nil }
+        let fresh = freshSamples(now: now)
+        let overnight = fresh.filter { $0.isOvernightSample }.compactMap(\.lnRMSSD)
+        if overnight.count >= Self.overnightHRVPreferenceMinimum {
+            return stats(overnight)
+        }
+        // Ramp toward the overnight-only baseline instead of switching at a cliff:
+        // w = overnightCount / 7 blends the overnight stats with the all-fresh stats
+        // so mean/sd are continuous as the 7th overnight sample arrives.
+        guard overnight.count >= 1,
+              let overnightStats = stats(overnight),
+              let allStats = stats(fresh.compactMap(\.lnRMSSD)),
+              allStats.count > overnightStats.count
+        else {
+            return stats(fresh.compactMap(\.lnRMSSD))
+        }
+        let w = min(Double(overnight.count) / Double(Self.overnightHRVPreferenceMinimum), 1)
+        let mean = w * overnightStats.mean + (1 - w) * allStats.mean
+        let variance = w * (overnightStats.sd * overnightStats.sd + pow(overnightStats.mean - mean, 2))
+            + (1 - w) * (allStats.sd * allStats.sd + pow(allStats.mean - mean, 2))
+        return (mean, sqrt(variance), allStats.count)
+    }
+
+    /// Produces a 30-civil-day robust comparison receipt.  Recovery model v4
+    /// prefers this median/MAD receipt as its HRV comparator when
+    /// `hrvTrusted` (the same 14 recent-night qualification rule that governs
+    /// the EMA path); untrusted receipts leave the legacy EMA stats in
+    /// charge, so maturity is never invented by the statistic swap.
+    func recoveryComparison(
+        now: Date,
+        calendar: Calendar = .current
+    ) -> RecoveryComparison {
+        let canonical = Self.canonicalDailySamples(samples, calendar: calendar)
+        let today = calendar.startOfDay(for: now)
+        let comparisonStart = calendar.date(
+            byAdding: .day,
+            value: -(Self.recoveryComparisonHorizonDays - 1),
+            to: today
+        ) ?? today
+        let comparisonSamples = canonical.filter { sample in
+            let day = calendar.startOfDay(for: sample.date)
+            return day >= comparisonStart && day <= today && sample.date <= now
+        }
+
+        let recentRestingDays = freshRestingSampleCount(now: now)
+        let recentHRVNights = freshHRVSampleCount(now: now)
+        let isCurrent = !isStale(now: now)
+        let restingTrusted = isCurrent && recentRestingDays >= Self.trustedMinimumSamples
+        let hrvTrusted = hrvQualificationVersion >= Self.currentHRVQualificationVersion
+            && isCurrent
+            && recentHRVNights >= Self.trustedMinimumSamples
+
+        return RecoveryComparison(
+            asOf: now,
+            comparisonHorizonDays: Self.recoveryComparisonHorizonDays,
+            recentQualificationHorizonDays: Self.recoveryRecentQualificationHorizonDays,
+            statistic: "median_mad",
+            restingHeartRate: Self.robustStats(comparisonSamples.map(\.restingHR)),
+            hrv: hrvQualificationVersion >= Self.currentHRVQualificationVersion
+                ? Self.robustStats(comparisonSamples
+                    .filter(\.isOvernightSample)
+                    .compactMap(\.lnRMSSD))
+                : nil,
+            recentQualifiedRestingDays: recentRestingDays,
+            recentQualifiedHRVNights: recentHRVNights,
+            restingTrusted: restingTrusted,
+            hrvTrusted: hrvTrusted
+        )
+    }
+
+    /// Feedback vs the learned norm: negative = below baseline (more recovered).
+    func delta(comparedTo resting: Int) -> Int? {
+        guard let base = restingInt else { return nil }
+        return resting - base
+    }
+
+    private func stats(_ values: [Double]) -> (mean: Double, sd: Double, count: Int)? {
+        guard !values.isEmpty else { return nil }
+        let mean = values.reduce(0, +) / Double(values.count)
+        guard values.count > 1 else { return (mean, 0, values.count) }
+        let variance = values.reduce(0) { $0 + pow($1 - mean, 2) } / Double(values.count - 1)
+        return (mean, sqrt(variance), values.count)
+    }
+
+    /// Median and median absolute deviation prevent one corrupted or unusually
+    /// stressful night from moving a future recovery comparator.  A zero MAD is
+    /// meaningful (the cohort is identical); downstream models must apply their
+    /// explicit minimum scale rather than quietly inflating it with an outlier.
+    private static func robustStats(_ values: [Double]) -> RecoveryComparison.Statistic? {
+        let finite = values.filter(\.isFinite).sorted()
+        guard !finite.isEmpty else { return nil }
+        let location = median(finite)
+        let deviations = finite.map { abs($0 - location) }.sorted()
+        return RecoveryComparison.Statistic(
+            location: location,
+            scale: median(deviations) * 1.4826,
+            sampleCount: finite.count
+        )
+    }
+
+    private static func median(_ sortedValues: [Double]) -> Double {
+        let midpoint = sortedValues.count / 2
+        if sortedValues.count.isMultiple(of: 2) {
+            return (sortedValues[midpoint - 1] + sortedValues[midpoint]) / 2
+        }
+        return sortedValues[midpoint]
+    }
+
+    private mutating func rebuildLearnedValuesFromCanonicalSamples() {
+        restingHR = Self.ema(values: samples.map(\.restingHR),
+                             maximumStep: Self.maxRestingStepBPM)
+        hrvEMA = Self.ema(values: samples.compactMap(\.rmssd),
+                          maximumStep: Self.maxHRVStepMS)
+    }
+
+    private static func ema(values: [Double], maximumStep: Double) -> Double? {
+        guard var value = values.first else { return nil }
+        for next in values.dropFirst() {
+            let step = alpha * (next - value)
+            value += min(max(step, -maximumStep), maximumStep)
+        }
+        return value
+    }
+
+    // Persistence
+    static let persistenceKey = "personalBaseline"
+    static func load() -> PersonalBaseline {
+        guard let data = UserDefaults.standard.data(forKey: persistenceKey),
+              let b = try? JSONDecoder().decode(PersonalBaseline.self, from: data)
+        else { return PersonalBaseline() }
+        return b
+    }
+    func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: Self.persistenceKey)
+        }
+    }
+}
+
+// MARK: - Athlete profile / onboarding
+
+struct AthleteProfile: Codable, Equatable {
+    enum BiologicalSex: String, Codable, CaseIterable, Identifiable {
+        case male
+        case female
+        case unspecified
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .male: return "Male"
+            case .female: return "Female"
+            case .unspecified: return "Unspecified"
+            }
+        }
+    }
+
+    enum HRMaxSource: String, Codable, CaseIterable, Identifiable {
+        case ageEstimate
+        case measured
+
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .ageEstimate: return "Age"
+            case .measured: return "Measured"
+            }
+        }
+    }
+
+    var age: Int
+    var measuredMaxHR: Int
+    var maxHRSource: HRMaxSource
+    var biologicalSex: BiologicalSex
+    var weightKg: Double
+    var heightCm: Double
+    var updated: Date?
+    var hasCompletedOnboarding: Bool
+
+    static let persistenceKey = "athleteProfile"
+    static let onboardingCompletionKey = "atria.onboarding.completed.v1"
+    enum CodingKeys: String, CodingKey {
+        case age, measuredMaxHR, maxHRSource, biologicalSex, weightKg, heightCm, updated, hasCompletedOnboarding
+    }
+
+    static var defaultAge: Int { 30 }
+    static var defaultMeasuredMaxHR: Int {
+        defaultMeasuredMaxHR(userDefaults: .standard)
+    }
+
+    static func defaultMeasuredMaxHR(userDefaults: UserDefaults) -> Int {
+        userDefaults.object(forKey: "maxHR") as? Int ?? 190
+    }
+
+    init(age: Int, measuredMaxHR: Int, maxHRSource: HRMaxSource,
+         biologicalSex: BiologicalSex = .unspecified,
+         weightKg: Double = 0,
+         heightCm: Double = 0,
+         updated: Date?, hasCompletedOnboarding: Bool) {
+        self.age = age
+        self.measuredMaxHR = measuredMaxHR
+        self.maxHRSource = maxHRSource
+        self.biologicalSex = biologicalSex
+        self.weightKg = weightKg
+        self.heightCm = heightCm
+        self.updated = updated
+        self.hasCompletedOnboarding = hasCompletedOnboarding
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        age = try c.decodeIfPresent(Int.self, forKey: .age) ?? Self.defaultAge
+        measuredMaxHR = try c.decodeIfPresent(Int.self, forKey: .measuredMaxHR) ?? Self.defaultMeasuredMaxHR
+        // A legacy scalar is not evidence that the value was measured. Older
+        // payloads commonly persisted the 190 placeholder without provenance;
+        // treating that as measured silently upgrades strain confidence and can
+        // unlock VO2max. Only an explicitly encoded source may claim measured.
+        maxHRSource = try c.decodeIfPresent(HRMaxSource.self, forKey: .maxHRSource) ?? .ageEstimate
+        biologicalSex = try c.decodeIfPresent(BiologicalSex.self, forKey: .biologicalSex) ?? .unspecified
+        weightKg = try c.decodeIfPresent(Double.self, forKey: .weightKg) ?? 0
+        heightCm = try c.decodeIfPresent(Double.self, forKey: .heightCm) ?? 0
+        updated = try c.decodeIfPresent(Date.self, forKey: .updated)
+        hasCompletedOnboarding = try c.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? false
+    }
+
+    var ageEstimatedMaxHR: Int {
+        Int((208.0 - 0.7 * Double(age)).rounded())
+    }
+
+    var maxHR: Int {
+        switch maxHRSource {
+        case .ageEstimate: return ageEstimatedMaxHR
+        case .measured: return measuredMaxHR
+        }
+    }
+
+    var sourceLabel: String {
+        switch maxHRSource {
+        case .ageEstimate: return "age estimate"
+        case .measured: return "measured"
+        }
+    }
+
+    var hasEnergyProfile: Bool {
+        biologicalSex != .unspecified && weightKg > 0
+    }
+
+    static func load(userDefaults: UserDefaults = .standard) -> AthleteProfile {
+        let completedFlag = userDefaults.bool(forKey: onboardingCompletionKey)
+        guard let data = userDefaults.data(forKey: persistenceKey),
+              let p = try? JSONDecoder().decode(AthleteProfile.self, from: data)
+        else {
+            return AthleteProfile(age: defaultAge,
+                                  measuredMaxHR: defaultMeasuredMaxHR(userDefaults: userDefaults),
+                                  maxHRSource: .ageEstimate,
+                                  biologicalSex: .unspecified,
+                                  weightKg: 0,
+                                  heightCm: 0,
+                                  updated: nil,
+                                  hasCompletedOnboarding: completedFlag)
+        }
+        guard completedFlag, !p.hasCompletedOnboarding else { return p }
+        var bridged = p
+        bridged.hasCompletedOnboarding = true
+        return bridged
+    }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: Self.persistenceKey)
+        }
+        UserDefaults.standard.set(maxHR, forKey: "maxHR")
+        UserDefaults.standard.set(hasCompletedOnboarding, forKey: Self.onboardingCompletionKey)
+    }
+
+    mutating func clamp() {
+        age = min(max(age, 13), 100)
+        measuredMaxHR = min(max(measuredMaxHR, 120), 220)
+        weightKg = weightKg > 0 ? min(max(weightKg, 30), 250) : 0
+        heightCm = heightCm > 0 ? min(max(heightCm, 120), 230) : 0
+        updated = Date()
+    }
+
+    mutating func completeOnboarding() {
+        clamp()
+        hasCompletedOnboarding = true
+        UserDefaults.standard.set(true, forKey: Self.onboardingCompletionKey)
+    }
+}
+
+// REMOVED 2026-08-26: BaselineCard had no call sites anywhere in the app.
+//
+// `import Charts` lived at line 689 of this file, INSIDE the region the card
+// occupied — legal Swift, and invisible to a `head` of the imports. Removing
+// the card took the import with it and broke RestingTrendChart below, which
+// is the only thing here that actually needs Charts. Hoisted to the top.
+
+struct RestingTrendPoint: Identifiable {
+    let id: UUID
+    let start: Date
+    let resting: Int
+}
+
+struct RestingTrendChart: View {
+    let points: [RestingTrendPoint]
+    let baseline: Int?
+    private let segmentedSamples: [AtriaTrendPoint.Sample]
+
+    init(points: [RestingTrendPoint], baseline: Int?) {
+        self.points = points
+        self.baseline = baseline
+        // Prepare once when the value view is created. Chart and inspector
+        // both consume this projection, so neither repeats mapping/sorting
+        // while SwiftUI evaluates their render closures.
+        segmentedSamples = AtriaTrendGapPolicy.assigningSegments(to: points.map {
+            AtriaTrendPoint.Sample(date: $0.start, value: Double($0.resting))
+        })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Resting HR trend").font(.headline)
+            if points.count < 2 {
+                Text("Save at least two sessions to see your trend.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Chart {
+                    ForEach(segmentedSamples) { sample in
+                        LineMark(x: .value("Date", sample.date),
+                                 y: .value("Resting", sample.value),
+                                 series: .value("Observed run", "resting-\(sample.segment)"))
+                            .interpolationMethod(.monotone)
+                            .lineStyle(AtriaChartVisualGrammar.trendLine)
+                            .foregroundStyle(.teal)
+                        PointMark(x: .value("Date", sample.date),
+                                  y: .value("Resting", sample.value))
+                            .foregroundStyle(.teal)
+                    }
+                }
+                .atriaGraphPlotSurface()
+                .frame(height: 160)
+                .atriaInspectableGraph(
+                    AtriaInspectableGraph(
+                        title: "Resting HR trend",
+                        subtitle: baseline.map { "Baseline \($0) bpm" },
+                        content: .timeSeries([
+                            .init(title: "Resting HR",
+                                  unit: " bpm",
+                                  tint: .teal,
+                                  points: segmentedSamples.map {
+                                      .init(date: $0.date,
+                                            value: $0.value,
+                                            segment: $0.segment)
+                                  })
+                        ], domain: nil)
+                    )
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Session time-in-zone breakdown
+
+struct TimeInZoneRow: Identifiable {
+    let zone: HRZone
+    let seconds: Double
+
+    var id: Int { zone.rawValue }
+}
+
+struct TimeInZoneView: View {
+    let rows: [TimeInZoneRow]
+    let total: Double
+    /// GAP-03: the HRR boundaries that produced these rows, so every zone
+    /// label carries its actual BPM range. Nil marks a legacy computation
+    /// whose exact ranges are no longer provable.
+    var boundaries: AtriaHRRZoneBoundaries? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Time in zone").font(.headline)
+            ForEach(rows) { row in
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(row.zone.name)
+                            .font(.caption)
+                        Text(boundaries?.rangeText(for: row.zone) ?? "Legacy range")
+                            .font(.caption2.weight(.medium).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(width: 88, alignment: .leading)
+                    GeometryReader { geo in
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(row.zone.color.gradient)
+                            .frame(width: geo.size.width * row.seconds / total)
+                    }
+                    .frame(height: 14)
+                    Text(fmt(row.seconds))
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        .frame(width: 52, alignment: .trailing)
+                }
+            }
+        }
+        .atriaInspectableGraph(rows.isEmpty ? nil : AtriaInspectableGraph(
+            title: "Time in heart-rate zones",
+            subtitle: "Recorded session duration",
+            content: .histogram(rows.map { row in
+                .init(label: row.zone.name,
+                      value: row.seconds / 60,
+                      unit: " min",
+                      tint: row.zone.color)
+            })
+        ))
+    }
+
+    private func fmt(_ s: Double) -> String {
+        let i = Int(s)
+        return i >= 60 ? "\(i/60)m \(i%60)s" : "\(i)s"
+    }
+}

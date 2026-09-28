@@ -1,0 +1,273 @@
+import SwiftUI
+import Charts
+
+/// Fixed 7-day weekday bar chart of verified per-day step totals (design backlog
+/// P2, 2026-08-03). Matches the "7 fixed weekday ticks" rule: seven day-ticks
+/// always, a bar only on days with a verified receipt (missing ≠ zero, never a
+/// zero-height bar implying "0 steps recorded"). Native Swift Charts.
+///
+/// Self-contained (no environment) so it renders straight to an image in a test.
+struct AtriaStepsWeekChart: View {
+    /// Day-start → verified step total. Days absent from the map draw no bar.
+    let stepsByDay: [Date: Int]
+    let goal: Int
+    /// The day the 7-day window ends on (defaults to today). A parameter so a
+    /// test can anchor deterministically.
+    var referenceDate: Date = Date()
+    /// Days whose count is only partial (still open, strap off or history not
+    /// synced). Drawn faded with an "at least" `+`, never coloured as a
+    /// missed goal.
+    var partialDays: Set<Date> = []
+
+    private let calendar = Calendar.current
+
+    /// The civil day a physiological cycle belongs to on this chart.
+    ///
+    /// Receipts are keyed by a WAKE boundary, not by midnight, so a cycle
+    /// straddles two dates. Bucketing on `startOfDay(windowStart)` labelled a
+    /// cycle by the day it woke, which for a late-evening wake put nearly all
+    /// of its steps under the PREVIOUS day's letter — a cycle running
+    /// Sun 20:26 → Mon 20:56 drew on Sunday while being almost entirely Monday.
+    ///
+    /// Owner's decision (2026-08-26): label by the day the cycle predominantly
+    /// covers. This walks the civil days the window touches and returns the one
+    /// holding the most of it.
+    ///
+    /// An exact tie — a cycle split evenly across midnight — keeps the EARLIER
+    /// day, so the result is deterministic rather than dependent on iteration
+    /// order.
+    /// Open-cycle tolerance: a receipt whose window ends within this of now is
+    /// still running.
+    static let openCycleTolerance: TimeInterval = 90 * 60
+
+    /// Strap-step receipts folded onto the civil days their cycles cover.
+    ///
+    /// ONE authority for every surface that draws daily strap steps. The
+    /// Overview week chart and the Today sparkline are the same metric on two
+    /// screens, and this rule is subtle enough that a second copy would drift:
+    /// it already happened once between a card and its own chart, where the
+    /// headline read 5,878 while the chart folded it into a 7,336 bar on the
+    /// previous day.
+    static func dailyStepTotals(
+        receipts: [HistoricalArchive.MotionTickDayEvidence],
+        now: Date,
+        calendar: Calendar = .current
+    ) -> [Date: Int] {
+        let today = calendar.startOfDay(for: now)
+
+        // Drop receipts whose window is FULLY CONTAINED in another receipt's.
+        //
+        // The sum below is correct for genuinely disjoint cycles, and its own
+        // comment used to justify itself with "cycles do not overlap". The
+        // device says otherwise: of 32 stored receipts, 17 overlap another and
+        // EIGHT sit entirely inside one. Summing those counts the same walking
+        // twice — 15 Aug held two 154-step receipts, one window inside the
+        // other, and shipped 308. 21 Aug shipped 3,442 with a 901-step window
+        // sitting inside an 1,118-step one.
+        //
+        // Only full containment is removed here, because it is the only case
+        // that is provably duplicate: a contained window's steps all occurred
+        // inside the outer window, so the outer receipt already counts them.
+        // The store says the same thing in its own words -- see
+        // `AtriaWhoop4MotionTickDailyStore.mergingCurrentCycleReceipt`: "A
+        // receipt beginning later in the same physiological cycle is only a
+        // CONTAINED SUBSET". That rule governs admitting a receipt to the
+        // CURRENT cycle; this applies the same relationship to closed receipts
+        // being folded onto civil days.
+        //
+        // WHY THEY OVERLAP AT ALL, since deduplicating here treats a symptom:
+        // a receipt's window begins at
+        // `AtriaPhysiologicalCycle.current(...).start`, derived from confirmed
+        // sleeps. When no sleep confirms, that boundary comes from the
+        // no-sleep fallback and MOVES between publications, so successive
+        // publications of one real cycle are written with different starts and
+        // the later lands inside the earlier. On this device 17 of 32 receipts
+        // overlap -- a direct consequence of sleep not confirming, not an
+        // independent bug.
+        // PARTIAL overlaps are deliberately left alone — the receipts carry no
+        // per-interval breakdown, so there is no honest way to subtract the
+        // shared portion, and dropping either whole receipt would delete real
+        // steps from outside the overlap.
+        let ordered = receipts.sorted { $0.windowStart < $1.windowStart }
+        let deduplicated = ordered.filter { candidate in
+            !ordered.contains { other in
+                guard other.windowStart != candidate.windowStart
+                        || other.windowEnd != candidate.windowEnd else { return false }
+                let contains = other.windowStart <= candidate.windowStart
+                    && other.windowEnd >= candidate.windowEnd
+                return contains
+            }
+        }
+
+        var totals: [Date: Int] = [:]
+        for receipt in deduplicated {
+            // Predominant coverage is only stable once a window has CLOSED. An
+            // open cycle that began yesterday morning reads as yesterday's now
+            // and would flip to today's a few hours later, so its bar would
+            // migrate between days while the user watched — and it is also the
+            // number the card shows as "today", which the chart must match.
+            let isOpenCycle = receipt.windowEnd >= now.addingTimeInterval(-openCycleTolerance)
+            let day = isOpenCycle
+                ? today
+                : predominantCivilDay(windowStart: receipt.windowStart,
+                                      windowEnd: receipt.windowEnd,
+                                      calendar: calendar)
+            // SUM, not max: two CLOSED receipts on one day are two genuinely
+            // different cycles, and `max` silently dropped the smaller.
+            totals[day, default: 0] += receipt.steps
+        }
+        return totals
+    }
+
+    static func predominantCivilDay(windowStart: Date,
+                                    windowEnd: Date,
+                                    calendar: Calendar) -> Date {
+        let first = calendar.startOfDay(for: windowStart)
+        guard windowEnd > windowStart else { return first }
+
+        var best = first
+        var bestOverlap: TimeInterval = 0
+        var dayStart = first
+        while dayStart < windowEnd {
+            guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart),
+                  dayEnd > dayStart else { break }
+            let overlap = min(windowEnd, dayEnd)
+                .timeIntervalSince(max(windowStart, dayStart))
+            if overlap > bestOverlap {
+                bestOverlap = overlap
+                best = dayStart
+            }
+            dayStart = dayEnd
+        }
+        return best
+    }
+
+    /// Completed-day performance colour (2026-08-08 user request): green at or
+    /// above the daily goal, orange under it, red well under (< half). This is
+    /// deliberately NOT `Metrics.stepsZone`, which never reds a *mid-day* Today
+    /// card; here every bar is a COMPLETED day where under-target is a real
+    /// read. Bars are still verified LOWER BOUNDS, so the honest caption stays.
+    enum BarStyle: Equatable { case met, under, wellUnder, partial }
+
+    /// 2026-09-24: a partial day (today so far, or not fully covered) is not a
+    /// completed day, so it is never judged against the goal: before this the
+    /// in-progress bar for today turned red every morning. A partial day that
+    /// already met the goal still shows met, since the count is a lower bound.
+    static func barStyle(steps: Int, goal: Int, isPartial: Bool) -> BarStyle {
+        let ratio = Double(steps) / Double(max(goal, 1))
+        if ratio >= 1.0 { return .met }
+        if isPartial { return .partial }
+        return ratio >= 0.5 ? .under : .wellUnder
+    }
+
+    /// "4,210+" for a partial day: an at-least count, never a fake total.
+    static func countLabel(steps: Int, isPartial: Bool) -> String {
+        steps.formatted(.number.grouping(.automatic)) + (isPartial ? "+" : "")
+    }
+
+    private func barTint(_ style: BarStyle) -> Color {
+        switch style {
+        case .met: return Metrics.electricGreen
+        case .under: return .orange
+        case .wellUnder: return .red
+        case .partial: return Color.secondary.opacity(0.55)
+        }
+    }
+
+    var body: some View {
+        let end = calendar.startOfDay(for: referenceDate)
+        let start = calendar.date(byAdding: .day, value: -6, to: end) ?? end
+        let days = (0...6).compactMap { calendar.date(byAdding: .day, value: $0, to: start) }
+        let hasAny = days.contains { stepsByDay[$0] != nil }
+        // Exactly the seven days, edge to edge. A `unit: .day` BarMark occupies
+        // its whole day slot, so a domain of [first 00:00, last 24:00) gives
+        // each bar precisely one seventh of the width with no dead margin —
+        // the earlier ±18h padding bought room for the end labels at the cost
+        // of insetting every bar from the plot edges.
+        let axisLo = start
+        let axisHi = calendar.date(byAdding: .day, value: 1, to: end) ?? end
+
+        VStack(alignment: .leading, spacing: 8) {
+            Text("This week")
+                .font(.subheadline.weight(.semibold))
+
+            if hasAny {
+                Chart {
+                    ForEach(days, id: \.self) { day in
+                        if let steps = stepsByDay[day] {
+                            let isPartial = partialDays.contains(day)
+                            BarMark(x: .value("Day", day, unit: .day),
+                                    y: .value("Steps", steps),
+                                    width: .ratio(AtriaChartVisualGrammar.dailyBarWidthRatio))
+                                .foregroundStyle(barTint(Self.barStyle(steps: steps, goal: goal,
+                                                                       isPartial: isPartial))
+                                    .opacity(isPartial ? 0.6 : 0.85))
+                                .cornerRadius(AtriaChartVisualGrammar.dailyBarCornerRadius)
+                                // Per-bar count (2026-08-08): bars alone gave no
+                                // read of the actual number. Small label above
+                                // each bar; days with no bar stay empty.
+                                // The newest day sits hard against the trailing
+                                // edge, so its count was clipped mid-number
+                                // ("5,8" for 5,878) — the chart cut the one
+                                // value the reader most wants. Let Charts pull
+                                // an overflowing label back inside the plot.
+                                .annotation(position: .top, spacing: 2) {
+                                    Text(Self.countLabel(steps: steps, isPartial: partialDays.contains(day)))
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize()
+                                }
+                        }
+                    }
+                    if goal > 0 {
+                        RuleMark(y: .value("Goal", goal))
+                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                            .foregroundStyle(.secondary.opacity(0.5))
+                            .annotation(position: .top, alignment: .trailing, spacing: 1) {
+                                Text("goal \(goal)")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                    }
+                }
+                .atriaDailyChartPlotChrome()
+                .chartXScale(domain: axisLo...axisHi)
+                .chartXAxis {
+                    AxisMarks(values: days) { _ in
+                        AxisGridLine().foregroundStyle(.secondary.opacity(0.14))
+                        AxisTick().foregroundStyle(.clear)
+                        // `centered: true` places the letter in the MIDDLE of
+                        // the day it names, which is where a `unit: .day` bar
+                        // is drawn.
+                        AxisValueLabel(format: .dateTime.weekday(.narrow),
+                                       centered: true)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .atriaDailyQuantityYAxis()
+                .frame(height: 140)
+                // The plot used to be pulled 12pt wider than its card on each
+                // side to sit "full bleed". That is wider than the space it
+                // has, so the axis labels and the newest day's bar fell outside
+                // and `.clipped()` cut them off — the chart lost its most
+                // recent column, which is the one the reader wants most. Let it
+                // fit the card instead.
+
+                Text(partialDays.isEmpty
+                     ? "Green met goal · amber under · red well under. No bar, no reading."
+                     : "Green met · amber under · red well under · grey + so far.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Verified step days will appear here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .atriaInsetCard(tint: Metrics.electricGreen)
+    }
+}

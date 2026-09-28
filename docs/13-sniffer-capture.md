@@ -1,0 +1,89 @@
+# Gate B — BLE sniffer capture plan (official WHOOP app)
+
+Goal: capture the official WHOOP app driving **this** strap, so we learn the two
+things our app doesn't know: the command sequence that makes RR continuous, and/or
+the historical-transfer request that yields `0x2f` data frames.
+
+A later IMU question (2026-09-20): official Strength Trainer sends `TOGGLE_IMU_MODE
+0x6A` and compact `0x33` flows during that workout. That is a **firmware liveness
+probe**, not an all-day Atria path, and it is not this sniffer plan’s job. Keep
+official WHOOP off unless that probe is explicit. Type-43 / `0x3F` / `0x51` still
+kill this iPhone’s BLE link. Ledger: `WHOOP4_PROTOCOL_FINDINGS.md` (2026-09-20).
+
+Analyzer is ready: `tools/analyze_sniffer.py` (decodes the trace with `whoop_codec`).
+
+---
+
+## STEP 0 — Feasibility gate (do this FIRST, before buying/setting up anything)
+
+The sniffer only works if the **official WHOOP app can actually connect to and
+stream from this strap.** This strap is bound to a prior owner (`boylston`), and
+the WHOOP app requires an account.
+
+**Check:** install the official WHOOP app, sign in / create an account, and try to
+add this strap. Watch live HR appear in the official app.
+- ✅ If the official app shows live data from this strap → proceed to STEP 1.
+- ❌ If it can't claim/connect the strap (owned by another account, needs
+  subscription) → **the sniffer route is infeasible**; there is nothing to capture.
+  Fall back to "defer HRV, build elsewhere" and revisit if ownership is resolved.
+
+Do not skip Step 0 — it determines whether the rest is possible.
+
+---
+
+## STEP 1 — Hardware & software
+
+- **Sniffer:** Nordic **nRF52840 Dongle** (~$10) flashed with the **nRF Sniffer for
+  Bluetooth LE** firmware (Nordic's free tool). (A Bluefruit LE Sniffer also works.)
+- **Wireshark** (includes `tshark`) + the nRF Sniffer Wireshark plugin (Nordic's
+  installer adds the capture interface).
+- macOS: `brew install --cask wireshark` then install the nRF Sniffer plugin per
+  Nordic's guide.
+
+## STEP 2 — Capture
+
+1. Open Wireshark, select the **nRF Sniffer** interface.
+2. In the sniffer toolbar, set it to **follow the WHOOP device** (pick it by name/
+   address shown for your strap so you capture its connection, not all traffic).
+3. Start capture.
+4. In the **official WHOOP app**: disconnect/reconnect the strap so you capture a
+   **fresh connection from scratch** (the init handshake is the prize).
+5. Capture these windows (keep the strap on, still, snug — same fit discipline):
+   - **0–60 s after connect:** the full connection setup + every command write.
+   - **2–5 min steady state:** to measure the official app's RR-frame rate.
+   - If the app has a "reprocess / sync / view HRV" action, trigger it to force a
+     **historical sync** and capture the preceding writes + any `0x2f` frames.
+6. Stop capture; **File → Save As** `whoop_official.pcapng`.
+
+## STEP 3 — Decode the ATT layer and analyze
+
+```bash
+./tools/decode_whoop_att_capture.py whoop_official.pcapng \
+  --output docs/evidence/gate-b/sniffer/<timestamp>/whoop-att.csv
+./summarize_sniffer_trace.py \
+  docs/evidence/gate-b/sniffer/<timestamp>/whoop-att.csv
+```
+
+Keep both `whoop_official.pcapng`, `whoop-att.csv`, and its undecoded-byte sidecar
+in an ignored local evidence
+folder such as `docs/evidence/gate-b/sniffer/<timestamp>/`. Do not commit raw
+captures to the public repo.
+
+## STEP 4 — What we're looking for (decision)
+
+The analyzer prints **every command the official app wrote** and the **RR-bearing
+fraction**. Two possible wins:
+
+1. **Continuous-RR trigger:** if the official app's RR fraction is high (~≥90%),
+   diff its write sequence against ours (we send only `aa0800a82300030199bce9cf`).
+   The extra/different writes before sustained RR are the missing step → replicate
+   them in `AtriaBLEManager.armRealtime`.
+2. **Historical transfer:** if `0x2f` frames appear, preserve every preceding write
+   as protocol evidence. Do not label or replay any request until the sequence is
+   independently reviewed against a controlled outage.
+
+## STEP 5 — Then close Gate B
+
+Replicate the discovered sequence on the cabled iPhone, capture a clean ≥5-min RR
+window, and compare RMSSD within **±5 ms** of a reference (e.g. a Polar H10). Only
+then mark Gate B done. Until then HRV stays **learning** — no fabrication.

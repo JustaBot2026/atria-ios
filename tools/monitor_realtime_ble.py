@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Non-invasive realtime BLE validation monitor for Atria physical-device runs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_DEVICE = os.environ.get("ATRIA_DEVICE_ID", "")
+DEFAULT_BUNDLE = "com.adidshaft.atria"
+PREFS_SOURCE = "Library/Preferences/com.adidshaft.atria.plist"
+
+COUNTER_KEYS = [
+    "atria.link.attempts",
+    "atria.link.disconnects",
+    "atria.link.successes",
+    "atria.watchdog.hrContinuityCount",
+    "atria.watchdog.acceptedHRCount",
+    "atria.sample.rawNotifications",
+    "atria.sample.acceptedSamples",
+    "atria.keepalive.ticks",
+    "atria.radio.passiveR10ValidFrames",
+]
+
+STATUS_KEYS = [
+    "atria.sample.lastStatus",
+    "atria.link.lastStatus",
+    "atria.link.lastReason",
+    "atria.watchdog.lastAction",
+    "atria.keepalive.armed",
+    "atria.keepalive.lastStatus",
+    "atria.keepalive.lastAction",
+    "atria.keepalive.lastSilence",
+    "atria.keepalive.ticks",
+    "atria.radio.standardHROnly",
+    "atria.radio.passiveR10Status",
+    "atria.radio.passiveR10LastValidAt",
+    "atria.protectedR10.rollback",
+    "atria.protectedR10.streamSuppressed",
+    "atria.protectedR10.stableTransport",
+    "atria.longWear.enabled",
+    "atria.offlineSync.enabled",
+    "atria.offlineSync.attempts",
+    "atria.offlineSync.lastStatus",
+    "atria.offlineSync.lastReason",
+    "atria.offlineSync.rangeLossBackfillPending",
+    "atria.offlineSync.rangeLossBackfillReason",
+    "atria.offlineSync.rangeLossBackfillRequestedAt",
+    "atria.offlineSync.rangeLossBackfillStartedAt",
+]
+
+PULL_STATE_SUMMARY_KEYS = [
+    "process_status",
+    "process_name_status",
+    "official_whoop_process_status",
+    "official_whoop_process_count",
+    "official_whoop_main_process",
+    "official_whoop_widget_process",
+    "official_whoop_coexistence_risk",
+    "sessions_status",
+    "sessions_count",
+    "file_durability_status",
+    "latest_session_label",
+    "latest_session_points",
+    "latest_session_rr_points",
+    "latest_session_duration_s",
+    "active_journal_final_status",
+    "active_journal_reconstructed_from_segments",
+    "active_journal_samples",
+    "active_journal_rr_values",
+    "active_journal_freshness",
+    "active_journal_continuity_status",
+    "active_journal_continuity_reason",
+    "active_journal_duration_s",
+    "active_journal_interruption_class",
+    "live_stream_consistency_status",
+    "offline_sync_enabled",
+    "offline_sync_attempts",
+    "offline_sync_last_status",
+    "offline_sync_last_reason",
+    "offline_range_loss_backfill_pending",
+    "offline_range_loss_backfill_reason",
+    "offline_range_loss_backfill_requested_age_s",
+    "offline_range_loss_backfill_started_age_s",
+    "link_last_auto_save_status",
+    "link_last_auto_save_samples",
+    "link_last_auto_save_duration_s",
+]
+
+EVENT_ACTIONS = {
+    "app_switch_background": "Switch away from Atria now and keep another app foregrounded.",
+    "app_switch_return": "Return to Atria now.",
+    "brief_contact_loss_start": "Loosen or lift the strap for about 30 seconds.",
+    "brief_contact_loss_reseat": "Reseat the strap firmly now.",
+    "sustained_silence_start": "Take the strap off and set it down until the reseat marker.",
+    "sustained_silence_reseat": "Reseat the strap firmly now.",
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def copy_preferences(device: str, bundle: str, destination: Path) -> tuple[int, str]:
+    result = subprocess.run(
+        [
+            "xcrun",
+            "devicectl",
+            "device",
+            "copy",
+            "from",
+            "--device",
+            device,
+            "--domain-type",
+            "appDataContainer",
+            "--domain-identifier",
+            bundle,
+            "--source",
+            PREFS_SOURCE,
+            "--destination",
+            str(destination),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return result.returncode, result.stdout
+
+
+def read_preferences(path: Path) -> dict[str, Any]:
+    with path.open("rb") as handle:
+        data = plistlib.load(handle)
+    return {key: data.get(key, 0) for key in COUNTER_KEYS + STATUS_KEYS}
+
+
+def numeric(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
+
+
+def compute_delta(previous: dict[str, Any] | None, current: dict[str, Any]) -> dict[str, int]:
+    if previous is None:
+        return {key: 0 for key in COUNTER_KEYS}
+    return {key: numeric(current.get(key)) - numeric(previous.get(key)) for key in COUNTER_KEYS}
+
+
+def evaluate_sample(delta: dict[str, int], current: dict[str, Any], worn: bool) -> list[str]:
+    flags: list[str] = []
+    if worn and delta["atria.sample.rawNotifications"] <= 0:
+        flags.append("NO_NEW_DATA")
+    if worn and current.get("atria.protectedR10.streamSuppressed"):
+        flags.append("R10_STREAM_SUPPRESSED")
+    if (worn
+            and current.get("atria.radio.standardHROnly")
+            and not current.get("atria.protectedR10.streamSuppressed")
+            and delta["atria.radio.passiveR10ValidFrames"] <= 0):
+        flags.append("NO_NEW_R10")
+    if delta["atria.link.disconnects"] >= 3:
+        flags.append("DISCONNECT_CHURN")
+    if delta["atria.watchdog.hrContinuityCount"] >= 3:
+        flags.append("TEARDOWN_CHURN")
+    if worn and current.get("atria.sample.lastStatus") == "zero_contact":
+        flags.append("ZERO_CONTACT")
+    if current.get("atria.link.lastStatus") not in {None, "connected"}:
+        flags.append("NOT_CONNECTED")
+    if current.get("atria.longWear.enabled") and current.get("atria.keepalive.armed"):
+        stream_stalled = worn and delta["atria.sample.rawNotifications"] <= 0
+        if stream_stalled and delta["atria.keepalive.ticks"] <= 0:
+            flags.append("KEEPALIVE_NOT_ADVANCING")
+    return flags
+
+
+def summarize(samples: list[dict[str, Any]], worn: bool) -> dict[str, Any]:
+    deltas = [sample["delta"] for sample in samples[1:]]
+    flags = sorted({flag for sample in samples for flag in sample["flags"]})
+    raw_deltas = [delta["atria.sample.rawNotifications"] for delta in deltas]
+    accepted_deltas = [delta["atria.sample.acceptedSamples"] for delta in deltas]
+    disconnect_deltas = [delta["atria.link.disconnects"] for delta in deltas]
+    hr_continuity_deltas = [delta["atria.watchdog.hrContinuityCount"] for delta in deltas]
+    r10_deltas = [delta["atria.radio.passiveR10ValidFrames"] for delta in deltas]
+    return {
+        "status": "pass" if len(samples) > 1 and not flags else "fail",
+        "samples": len(samples),
+        "worn_expected": worn,
+        "flags": flags,
+        "min_raw_notification_delta": min(raw_deltas) if raw_deltas else 0,
+        "min_accepted_sample_delta": min(accepted_deltas) if accepted_deltas else 0,
+        "max_disconnect_delta": max(disconnect_deltas) if disconnect_deltas else 0,
+        "max_hr_continuity_delta": max(hr_continuity_deltas) if hr_continuity_deltas else 0,
+        "min_r10_frame_delta": min(r10_deltas) if r10_deltas else 0,
+        "latest": samples[-1]["current"] if samples else {},
+    }
+
+
+def event_outcomes(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    outcomes: list[dict[str, Any]] = []
+    by_index = {int(sample["sample"]): sample for sample in samples if "sample" in sample}
+    for sample in samples:
+        events = sample.get("events") or []
+        if not events:
+            continue
+        sample_index = int(sample["sample"])
+        next_sample = by_index.get(sample_index + 1)
+        next_delta = next_sample.get("delta", {}) if next_sample else {}
+        next_flags = next_sample.get("flags", []) if next_sample else []
+        raw_delta = numeric(next_delta.get("atria.sample.rawNotifications"))
+        disconnect_delta = numeric(next_delta.get("atria.link.disconnects"))
+        hr_continuity_delta = numeric(next_delta.get("atria.watchdog.hrContinuityCount"))
+        status = "pending_next_sample"
+        if next_sample:
+            if raw_delta > 0 and disconnect_delta < 3 and hr_continuity_delta < 3:
+                status = "recovered"
+            elif "NO_NEW_DATA" in next_flags:
+                status = "no_new_data_after_event"
+            elif disconnect_delta >= 3 or hr_continuity_delta >= 3:
+                status = "churn_after_event"
+            else:
+                status = "observed"
+        outcomes.append({
+            "sample": sample_index,
+            "events": events,
+            "status": status,
+            "next_sample": sample_index + 1 if next_sample else None,
+            "next_raw_notification_delta": raw_delta,
+            "next_accepted_sample_delta": numeric(next_delta.get("atria.sample.acceptedSamples")),
+            "next_disconnect_delta": disconnect_delta,
+            "next_hr_continuity_delta": hr_continuity_delta,
+            "next_flags": next_flags,
+        })
+    return outcomes
+
+
+def parse_key_value_lines(text: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key:
+            parsed[key] = value
+    return parsed
+
+
+def compact_pull_state_summary(fields: dict[str, str]) -> dict[str, str]:
+    return {key: fields[key] for key in PULL_STATE_SUMMARY_KEYS if key in fields}
+
+
+def parse_sample_events(values: list[str]) -> dict[int, list[str]]:
+    events: dict[int, list[str]] = {}
+    for value in values:
+        if ":" not in value:
+            raise ValueError(f"event must be SAMPLE:LABEL, got {value!r}")
+        sample_text, label = value.split(":", 1)
+        sample = int(sample_text)
+        if sample < 0:
+            raise ValueError(f"event sample must be >= 0, got {sample}")
+        label = label.strip()
+        if not label:
+            raise ValueError(f"event label must not be empty, got {value!r}")
+        events.setdefault(sample, []).append(label)
+    return events
+
+
+def event_actions_for(labels: list[str]) -> list[str]:
+    return [EVENT_ACTIONS[label] for label in labels if label in EVENT_ACTIONS]
+
+
+def pull_state_snapshot(device: str, bundle: str, out_dir: Path) -> dict[str, Any]:
+    evidence_dir = out_dir / "state"
+    result = subprocess.run(
+        [
+            "./pull_atria_state.sh",
+            "--device",
+            device,
+            "--bundle-id",
+            bundle,
+            "--evidence-dir",
+            str(evidence_dir),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    fields = parse_key_value_lines(result.stdout)
+    summary_path = evidence_dir / "pull-summary.txt"
+    if summary_path.exists():
+        fields.update(parse_key_value_lines(summary_path.read_text(encoding="utf-8", errors="replace")))
+    return {
+        "status": "ok" if result.returncode == 0 else "failed",
+        "exit_code": result.returncode,
+        "evidence_dir": str(evidence_dir),
+        "summary_file": str(summary_path),
+        "fields": compact_pull_state_summary(fields),
+    }
+
+
+def write_audit_snapshot(root: Path, destination: Path) -> dict[str, Any]:
+    try:
+        from tools import audit_realtime_ble_validation as audit
+    except ModuleNotFoundError:
+        import audit_realtime_ble_validation as audit
+
+    report = audit.evaluate(root)
+    destination.write_text(audit.markdown_summary(report), encoding="utf-8")
+    return {
+        "status": report.get("status", "missing"),
+        "path": str(destination),
+        "summary_count": report.get("summary_count", 0),
+        "blockers": report.get("blockers", []),
+    }
+
+
+def finalize_summary(summary_path: Path, summary: dict[str, Any], audit_root: Path | None = None) -> None:
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if audit_root is None:
+        return
+    audit_path = summary_path.parent / "audit.md"
+    summary["audit_snapshot"] = write_audit_snapshot(audit_root, audit_path)
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary["audit_snapshot"] = write_audit_snapshot(audit_root, audit_path)
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def command_string(argv: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in argv)
+
+
+def invocation_string(argv: list[str], *, device: str, bundle: str) -> str:
+    prefixes = []
+    if device != DEFAULT_DEVICE or os.environ.get("ATRIA_DEVICE_ID"):
+        prefixes.append(f"ATRIA_DEVICE_ID={shlex.quote(device)}")
+    if bundle != DEFAULT_BUNDLE:
+        prefixes.append(f"ATRIA_BUNDLE_ID={shlex.quote(bundle)}")
+    command = command_string(argv)
+    return " ".join([*prefixes, command]) if prefixes else command
+
+
+def git_commit() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", default=os.environ.get("ATRIA_DEVICE_ID", DEFAULT_DEVICE))
+    parser.add_argument("--bundle", default=DEFAULT_BUNDLE)
+    parser.add_argument("--samples", type=int, default=2)
+    parser.add_argument("--interval", type=float, default=120)
+    parser.add_argument("--label", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    parser.add_argument("--out-dir", type=Path, default=Path("logs/live-device/realtime-ble-monitor"))
+    parser.add_argument("--not-worn", action="store_true", help="Do not flag zero contact or rawNotif+0 as failures.")
+    parser.add_argument(
+        "--pull-state",
+        action="store_true",
+        help="After the monitor finishes, non-disruptively pull sessions and active journal evidence into the run directory.",
+    )
+    parser.add_argument(
+        "--event",
+        action="append",
+        default=[],
+        metavar="SAMPLE:LABEL",
+        help="Annotate a sample index in samples.jsonl/summary.json, e.g. --event 2:brief_contact_loss_reseat.",
+    )
+    parser.add_argument(
+        "--audit-snapshot",
+        action="store_true",
+        help="After writing summary.json, archive the realtime BLE audit Markdown into this run directory.",
+    )
+    args = parser.parse_args()
+
+    if args.samples < 1:
+        print("--samples must be >= 1", file=sys.stderr)
+        return 64
+    try:
+        sample_events = parse_sample_events(args.event)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 64
+
+    out_dir = (Path.cwd() / args.out_dir / args.label).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = out_dir / "samples.jsonl"
+    summary_path = out_dir / "summary.json"
+
+    previous: dict[str, Any] | None = None
+    samples: list[dict[str, Any]] = []
+    operator_actions: list[dict[str, Any]] = []
+    for index in range(args.samples):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        prefs_path = out_dir / f"prefs-{index:04d}-{stamp}.plist"
+        code, output = copy_preferences(args.device, args.bundle, prefs_path)
+        if code != 0:
+            sample = {
+                "sample": index,
+                "captured_at": utc_now(),
+                "copy_status": code,
+                "copy_output": output.strip(),
+                "current": {},
+                "delta": {key: 0 for key in COUNTER_KEYS},
+                "flags": ["PREFS_COPY_FAILED"],
+            }
+        else:
+            current = read_preferences(prefs_path)
+            delta = compute_delta(previous, current)
+            flags = [] if previous is None else evaluate_sample(delta, current, worn=not args.not_worn)
+            sample = {
+                "sample": index,
+                "captured_at": utc_now(),
+                "copy_status": code,
+                "prefs": str(prefs_path),
+                "current": current,
+                "delta": delta,
+                "flags": flags,
+            }
+            previous = current
+        sample_events_for_index = sample_events.get(index, [])
+        if sample_events_for_index:
+            sample["events"] = sample_events_for_index
+            actions = event_actions_for(sample_events_for_index)
+            if actions:
+                sample["operator_actions"] = actions
+                operator_actions.append({
+                    "sample": index,
+                    "events": sample_events_for_index,
+                    "actions": actions,
+                })
+        samples.append(sample)
+        with jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sample, sort_keys=True) + "\n")
+        print(
+            "ATRIA_REALTIME_BLE_SAMPLE "
+            f"index={index} rawNotif+{sample['delta']['atria.sample.rawNotifications']} "
+            f"accepted+{sample['delta']['atria.sample.acceptedSamples']} "
+            f"disc+{sample['delta']['atria.link.disconnects']} "
+            f"hrCont+{sample['delta']['atria.watchdog.hrContinuityCount']} "
+            f"keepaliveTicks+{sample['delta']['atria.keepalive.ticks']} "
+            f"r10+{sample['delta']['atria.radio.passiveR10ValidFrames']} "
+            f"sample={sample['current'].get('atria.sample.lastStatus')} "
+            f"lastAction={sample['current'].get('atria.watchdog.lastAction')} "
+            f"keepalive={sample['current'].get('atria.keepalive.lastAction')} "
+            f"keepaliveTicks={sample['current'].get('atria.keepalive.ticks')} "
+            f"events={','.join(sample_events_for_index) or 'none'} "
+            f"flags={','.join(sample['flags']) or 'OK'}",
+            flush=True,
+        )
+        for action in sample.get("operator_actions", []):
+            print(
+                "ATRIA_REALTIME_BLE_OPERATOR_ACTION "
+                f"index={index} action={shlex.quote(action)}",
+                flush=True,
+            )
+        if index + 1 < args.samples:
+            time.sleep(args.interval)
+
+    summary = summarize(samples, worn=not args.not_worn)
+    summary.update({
+        "label": args.label,
+        "started_at": samples[0]["captured_at"] if samples else utc_now(),
+        "finished_at": utc_now(),
+        "command": command_string(sys.argv),
+        "invocation": invocation_string(sys.argv, device=args.device, bundle=args.bundle),
+        "git_commit": git_commit(),
+        "device": args.device,
+        "bundle": args.bundle,
+        "jsonl": str(jsonl_path),
+        "out_dir": str(out_dir),
+        "planned_samples": args.samples,
+        "planned_interval_s": args.interval,
+        "events": {str(key): value for key, value in sorted(sample_events.items())},
+        "operator_actions": operator_actions,
+    })
+    outcomes = event_outcomes(samples)
+    if outcomes:
+        summary["event_outcomes"] = outcomes
+    if args.pull_state:
+        state = pull_state_snapshot(args.device, args.bundle, out_dir)
+        summary["state_pull"] = state
+    audit_root = (Path.cwd() / args.out_dir).resolve() if args.audit_snapshot else None
+    finalize_summary(summary_path, summary, audit_root)
+    state_text = ""
+    if "state_pull" in summary:
+        state_pull = summary["state_pull"]
+        state_fields = state_pull.get("fields", {})
+        continuity = state_fields.get("active_journal_continuity_status", "missing")
+        latest_points = state_fields.get("latest_session_points", "missing")
+        state_text = f" state_pull={state_pull.get('status')} continuity={continuity} latest_points={latest_points}"
+    print(
+        "ATRIA_REALTIME_BLE_SUMMARY "
+        f"status={summary['status']} samples={summary['samples']} "
+        f"min_raw_notification_delta={summary['min_raw_notification_delta']} "
+        f"max_disconnect_delta={summary['max_disconnect_delta']} "
+        f"max_hr_continuity_delta={summary['max_hr_continuity_delta']} "
+        f"min_r10_frame_delta={summary['min_r10_frame_delta']} "
+        f"flags={','.join(summary['flags']) or 'none'} "
+        f"summary={summary_path}"
+        f"{state_text}",
+        flush=True,
+    )
+    if "audit_snapshot" in summary:
+        audit_snapshot = summary["audit_snapshot"]
+        print(
+            "ATRIA_REALTIME_BLE_AUDIT "
+            f"status={audit_snapshot.get('status')} "
+            f"summary_count={audit_snapshot.get('summary_count')} "
+            f"path={audit_snapshot.get('path')}",
+            flush=True,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
